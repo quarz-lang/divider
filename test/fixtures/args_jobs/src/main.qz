@@ -54,8 +54,12 @@ def run(repo: Rotor::Repo) -> Void
   all = AllArgs.new(1, 2.5, "s", true, Time.utc(2026, 11, 8, 1, 2, 3) + 456.ms, Bytes[0, 255, 7], :sym, nil, [1, 2],
                     {"k" => 3}, Set["a", "b"], Inner.new(["x"], true))
   t = AllTypes.enqueue_args(repo: repo, args: all)
+  # The keyword form too, a collection's keyword taking its value as is.
+  k = AllTypes.enqueue(repo: repo, i: 1, f: 2.5, s: "s", b: true, t: all.t, by: all.by, sym: :sym, n: nil, xs: [1, 2],
+                       h: {"k" => 3}, set: Set["a", "b"], inner: Inner.new(["x"], true))
   Divider::Testing.drain(repo, jobs: [AllTypes])
   check(run_of(repo, t.id) == all.inspect, "every type: #{run_of(repo, t.id)} vs #{all.inspect}")
+  check(run_of(repo, k.id) == all.inspect, "every type, keywords: #{run_of(repo, k.id)} vs #{all.inspect}")
   # Arguments that no longer fit the class (a deploy changed it):
   # discarded, not retried, the error naming where.
   repo.exec("INSERT INTO divider_jobs (class, queue, args) VALUES ('Welcome', 'mail', '{\"user_id\": \"x\"}')")

@@ -3,8 +3,8 @@ class Error < StandardError
 end
 
 # A job's stored arguments that do not decode as its class's arguments type
-# (a deploy changed the fields): the job is discarded, not retried. (The
-# worker's decoding, which raises it, comes with quarz-lang/quarz#400.)
+# (a deploy changed the fields): the job is discarded, not retried, and
+# the error reported (`on_error`, or standard error).
 class ArgsError < Error
 end
 

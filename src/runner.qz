@@ -61,7 +61,12 @@ class Runner
     case e
     in Snooze => snooze
       Outcome.new(Worker::FINISH_SNOOZED, nil, snooze.delay.to_ms, :snoozed, ms, e.message)
-    in Discard | ArgsError
+    in Discard
+      Outcome.new(Worker::FINISH_DISCARDED, err, nil, :discarded, ms, e.message)
+    in ArgsError
+      # (Not the job's choice, as a Discard is: a deploy broke its
+      # arguments, which the operator hears of.)
+      report(e, ctx)
       Outcome.new(Worker::FINISH_DISCARDED, err, nil, :discarded, ms, e.message)
     else
       report(e, ctx)

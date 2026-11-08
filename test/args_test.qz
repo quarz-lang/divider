@@ -31,6 +31,13 @@ class ArgsTest < Test::Case
     assert_match(/main\.qz:64:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo, user_id: String\)/, text)
     assert_match(/main\.qz:65:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo, user_id: .*, colour: String\)/, text)
     assert_match(/main\.qz:66:39: error: argument `args` of enqueue_args\(.*\) -> Divider::Enqueued expects Good but found Int/, text)
+    # A job of arguments without `perform(args, job)`, and a subclass of
+    # one declaring others.
+    assert_match(/main\.qz:78:3: error: `method_ref\(:perform\)`: the handle to `NoPerform#perform` is a `Meta::Method\[NoPerform, \(Good, Divider::Context\) -> Void\]`, but `NoPerform` has no method `perform` of that type/, text)
+    assert_match(/main\.qz:82:3: error: `job_args` raised ArgumentError: Redeclared inherits the arguments of a job with `job_args`: a subclass cannot declare others/, text)
+    # (`Fine` and the others that declare `Good` are refused at nothing
+    # else: their `perform` is GoodBase's.)
+    refute_match(/main\.qz:(40|45|50|56|60):3: error: `method_ref/, text)
   end
 
   def test_jobs_with_arguments

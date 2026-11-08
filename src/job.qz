@@ -115,6 +115,13 @@ class Job
     end
     declared = statement_values[Meta::Field](:divider_args)
     raise ArgumentError.new("#{self.name} declares `job_args` twice") if declared.size > 0
+    # (An ancestor's `job_args` generated this marker: its `enqueue`,
+    # `unique` and arguments are this class's too.)
+    if method?(:__divider_job_args)
+      raise ArgumentError.new("#{self.name} inherits the arguments of a job with `job_args`: a subclass cannot declare others")
+    end
+    doc ":nodoc:"
+    def_method(:__divider_job_args) { true }
     fields.each { |f| declared.add(f) }
     scheduling = [Meta::Keyword.new(:at, Time, false, nullable: true),
                   Meta::Keyword.new(:after, Duration, false, nullable: true),
