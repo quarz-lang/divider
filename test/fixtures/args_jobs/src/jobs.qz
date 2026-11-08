@@ -1,0 +1,9 @@
+data Inner = (tags: Array[String], seen: Bool)
+
+data WelcomeArgs = (user_id: Int, template: String = "welcome", note: String? = nil, inner: Inner? = nil, kind: Symbol = :mail)
+
+class Welcome < Divider::Job
+  queue :mail
+  args WelcomeArgs
+  unique by: [:user_id]
+end

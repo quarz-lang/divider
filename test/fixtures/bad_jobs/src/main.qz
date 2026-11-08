@@ -1,0 +1,68 @@
+class Pen
+  @ink: Int = 0
+end
+
+data Good = (user_id: Int, template: String = "welcome")
+data Empty = ()
+data Named = (priority: Int)
+data Holding = (pen: Pen)
+data Deep = (inner: Holding)
+
+class BadQueue < Divider::Job
+  queue :"no-dash"
+end
+
+class BadAttempts < Divider::Job
+  max_attempts 0
+end
+
+class BadTimeout < Divider::Job
+  timeout 0.seconds
+end
+
+class NoFields < Divider::Job
+  args Empty
+end
+
+class ReservedName < Divider::Job
+  args Named
+end
+
+class NotEncodable < Divider::Job
+  args Holding
+end
+
+class NestedNotEncodable < Divider::Job
+  args Deep
+end
+
+class Twice < Divider::Job
+  args Good
+  args Good
+end
+
+class UniqueUnknown < Divider::Job
+  args Good
+  unique by: [:user]
+end
+
+class UniqueDefaulted < Divider::Job
+  args Good
+  unique by: [:template]
+end
+
+class UniqueFirst < Divider::Job
+  unique by: [:user_id]
+  args Good
+end
+
+class Fine < Divider::Job
+  args Good
+end
+
+def calls(repo: Rotor::Repo) -> Void
+  Fine.enqueue(repo: repo, user_id: "1")
+  Fine.enqueue(repo: repo)
+  Fine.enqueue(repo: repo, user_id: 1, colour: "red")
+  Fine.enqueue_args(repo: repo, args: 3)
+end

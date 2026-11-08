@@ -1,5 +1,5 @@
 # A job: a class whose `enqueue` inserts a row into `divider_jobs`, which
-# a worker (`Divider::Worker`) later runs. The class body sets its
+# a worker later runs. The class body sets its
 # options with statements that run at compile time:
 #
 # ```quarz no_run
@@ -59,14 +59,111 @@ abstract class Job
     end
   end
 
+  # The job's arguments: the fields of the `data` type `type`, declared
+  # in the class (`data Args(user_id: Int, template: String = "welcome")`,
+  # then `args Args`), JSON-encoded into the row. Generates
+  #
+  # - `enqueue(repo:, <the fields>, at:, after:, priority:)`, keywords
+  #   only: a field with a default is optional;
+  # - `enqueue_args(repo:, args:, at:, after:, priority:)`, with an args
+  #   value.
+  #
+  # A field's class is checked here: `Int`, `Integer`, `Float`,
+  # `String`, `Bool`, `Symbol`, `Time`, `Bytes`, `Array`, `Hash`, `Set`,
+  # another `data` type of such fields, or a nullable or union one
+  # (which `Type#fields` shows as `Object`). The keywords are typed by
+  # those classes only, without type arguments or nullability
+  # (quarz-lang/quarz#401): `enqueue_args` checks the value fully, and a
+  # value of the wrong type given to `enqueue` is found when the worker
+  # decodes it (`Divider::ArgsError`). A field cannot be named `repo`,
+  # `at`, `after` or `priority`, and `args` comes once.
+  static def self.args[A](type: Type[A]) -> Void
+    fields = type.fields
+    raise ArgumentError.new("#{type.name} has no fields: a job without arguments needs no `args`") if fields.empty?
+    fields.each do |f|
+      if SCHEDULING.include?(f.name)
+        raise ArgumentError.new("#{type.name}##{f.name}: a job's argument cannot be named #{f.name}, a keyword of `enqueue`")
+      end
+      Job.encodable!(f.type, "#{type.name}##{f.name}", 0)
+    end
+    declared = statement_values[Meta::Field](:divider_args)
+    raise ArgumentError.new("#{self.name} declares `args` twice") if declared.size > 0
+    fields.each { |f| declared.add(f) }
+    scheduling = [Meta::Keyword.new(:at, Time, false, nullable: true),
+                  Meta::Keyword.new(:after, Duration, false, nullable: true),
+                  Meta::Keyword.new(:priority, Int, false)]
+    keywords = [Meta::Keyword.new(:repo, Rotor::Repo, true)] +
+               fields.map { |f| Meta::Keyword.new(f.name, f.type, !f.default) } + scheduling
+    names = fields.map(&:name)
+    doc "Inserts the job with the arguments given (#{names.map { |n| "`#{n}`" }.join(", ")}), due now, at `at`, or `after` from the database's now, with `priority` (0 to 9, 5 by default)."
+    def_class_method(:enqueue, keywords: keywords) do |given| -> Enqueued
+      values: Hash[String, Object] = {}
+      given.each_pair { |k, v| values = values.put(k.to_s, v) unless Job::SCHEDULING.include?(k) }
+      Job.insert(self, given, JSON.generate(values))
+    end
+    args_type = type.as(Type[Object])
+    doc "Inserts the job with `args`, due now, at `at`, or `after` from the database's now, with `priority` (0 to 9, 5 by default)."
+    def_class_method(:enqueue_args, keywords: [Meta::Keyword.new(:repo, Rotor::Repo, true), Meta::Keyword.new(:args, args_type, true)] + scheduling) do |given| -> Enqueued
+      Job.insert(self, given, JSON.generate(given[:args]))
+    end
+    doc "The class of the job's arguments: `#{type.name}`."
+    def_class_method(:job_args_type) do -> Type[Object]?
+      args_type
+    end
+  end
+
+  # The class of the job's arguments, or nil for a job without (generated
+  # by `args`).
+  def self.job_args_type -> Type[Object]? = nil
+
+  # :nodoc:
+  # The keywords `enqueue` takes beside the arguments.
+  SCHEDULING = [:repo, :at, :after, :priority]
+
+  # :nodoc:
+  # Inserts a job of `cls` with the arguments `json` and the scheduling
+  # keywords of `given`.
+  def self.insert(cls: Type[Job], given: Hash[Symbol, Object], json: String) -> Enqueued
+    repo = given[:repo].as(Rotor::Repo)
+    priority = given[:priority]?.as?(Int) || 5
+    Queue.insert(repo, Queue::New.new(cls.name, cls.job_queue, json, priority, given[:at]?.as?(Time),
+                                      given[:after]?.as?(Duration), cls.job_max_attempts, cls.job_unique))
+  end
+
+  # :nodoc:
+  # Raises unless a field of the class `t` can be a job's argument
+  # (`args`); `path` names it.
+  static def self.encodable!(t: Type[Object], path: String, depth: Int) -> Void
+    return if ENCODABLE.any? { |e| t == e }
+    raise ArgumentError.new("#{path}: nested too deep") if depth > 16
+    if t.method?(:with) && t.method?(:to_h) && !t.fields.empty?
+      t.fields.each { |f| Job.encodable!(f.type, "#{path}.#{f.name}", depth + 1) }
+      return
+    end
+    raise ArgumentError.new("#{path}: a #{t.name} cannot be a job's argument (Int, Integer, Float, String, Bool, Symbol, Time, Bytes, Array, Hash, Set, nullable ones and data types of those)")
+  end
+
+  # :nodoc:
+  # The classes a job's argument may have, as `Type#fields` shows them.
+  ENCODABLE = [Int, Integer, Float, String, Bool, Symbol, Time, Bytes, Array, Hash, Set, Object]
+
   # At most one live job (scheduled, available or running) of the class
   # with the same values of the arguments `by` within each `period`
   # (from the epoch, by the database's clock), or ever without one:
   # `enqueue` gives the existing job's `Enqueued` instead of inserting.
+  # `by` names fields of the job's `args` that have no default (a field
+  # left to its default is absent from the row's JSON), so `unique`
+  # comes after `args`.
   static def self.unique(*, by: Array[Symbol] = [], period: Duration? = nil) -> Void
     ms = period&.to_ms
     raise ArgumentError.new("a unique period is at least 1s, not #{period}") if ms && ms < 1000
     raise ArgumentError.new("unique names an argument twice: #{by.inspect}") if by.uniq.size != by.size
+    declared = statement_values[Meta::Field](:divider_args).values
+    by.each do |n|
+      f = declared.find { |d| d.name == n }
+      raise ArgumentError.new("unique by: #{self.name} has no argument #{n} (`args` comes first)") if f.nil?
+      raise ArgumentError.new("unique by: the argument #{n} has a default, so it may be absent from a job's row: name arguments without one") if f.default
+    end
     u = Unique.new(by.map(&:to_s).sort, ms)
     doc "The job's uniqueness."
     def_class_method(:job_unique) do -> Unique?

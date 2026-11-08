@@ -4,3 +4,5 @@
 /Cog.lock
 # This machine's [patch] (docs/10 §2).
 /Cog.local.toml
+# The fixtures' resolutions (test/fixtures/*/Cog.toml).
+/test/fixtures/*/Cog.lock
