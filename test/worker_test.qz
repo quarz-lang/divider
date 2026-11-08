@@ -96,6 +96,12 @@ class WtArgsError < Divider::Job
   end
 end
 
+class WtSnoozeNow < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    raise Divider::Snooze.new(0.seconds)
+  end
+end
+
 class WtQuick < Divider::Job
   def perform(job: Divider::Context) -> Void
     Task.sleep(5.ms)
@@ -106,7 +112,7 @@ end
 # with two workers, the notification, failures and retries, Discard,
 # Snooze, timeouts, cancellation, shutdown, rescue and pruning.
 class WorkerTest < Test::Case
-  ALL = [WtCount, WtFail, WtDiscard, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo, WtArgsError, WtQuick]
+  ALL = [WtCount, WtFail, WtDiscard, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo, WtArgsError, WtQuick, WtSnoozeNow]
 
   def with_repo(&: (Rotor::Repo, String) -> Void) -> Void
     PG::Testing.with_cluster do |url|
@@ -430,6 +436,24 @@ class WorkerTest < Test::Case
       # (Those cut short or never started: back, the attempt not counted.)
       assert_equal(0, count(repo, "SELECT count(*) FROM divider_jobs WHERE state = 'available' AND attempt > 0"))
       assert_equal(200, count(repo, "SELECT count(*) FROM divider_jobs WHERE state IN ('completed', 'available')"))
+    end
+  end
+
+  def test_a_row_fetched_again_then_a_zero_grace
+    # (A snooze of nothing: the dispatcher fetches the row again while its
+    # earlier attempt is still listed; a zero grace then cuts the new one
+    # before it begins.)
+    with_repo do |repo, url|
+      10.times do |i|
+        job = WtSnoozeNow.enqueue(repo)
+        w = worker(url, queues: {default: 1}, poll: 10.ms, node: "n#{i}")
+        t = Task.spawn { w.run }
+        Task.sleep((20 + Random.rand(60)).ms)
+        w.shutdown(0.seconds)
+        t.await
+        assert_false(state(repo, job.id) == "running", "trial #{i}")
+        repo.exec("DELETE FROM divider_jobs")
+      end
     end
   end
 

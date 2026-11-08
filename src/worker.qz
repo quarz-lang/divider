@@ -198,7 +198,10 @@ class Worker
     # (The attempts that began: one spawned and cancelled before it began
     # never runs, so the dispatcher gives its row back at the end.)
     begun = Atom[Set[Int]].new(Set[Int].new)
-    unstarted: Array[Fetched] = []
+    # (By a number of each spawn: one row may be fetched again, a snooze
+    # of nothing, while its earlier attempt is still listed.)
+    unstarted: Array[[Int, Fetched]] = []
+    serial = 0
     w = self
     begin
       Task.scope do |js|
@@ -212,8 +215,10 @@ class Worker
           begin
             fetched.each do |row|
               tokens.receive
-              js.spawn { w.attempt(row, tokens, freed, begun) }
-              unstarted = unstarted + [row]
+              serial += 1
+              k = serial
+              js.spawn { w.attempt(row, tokens, freed, begun, k) }
+              unstarted = unstarted + [[k, row]]
               spawned += 1
             end
           rescue Task::Cancelled => c
@@ -224,7 +229,7 @@ class Worker
           # (Forget the attempts that began.)
           seen = begun.get
           unless seen.empty?
-            unstarted = unstarted.reject { |r| seen.include?(r.id) }
+            unstarted = unstarted.reject { |r| seen.include?(r[0]) }
             begun.update { |b| b - seen }
           end
           # (All the free slots taken: there may be more.)
@@ -270,7 +275,7 @@ class Worker
     ensure
       Task.uncancellable do
         seen = begun.get
-        unstarted.each { |row| release(row) unless seen.include?(row.id) }
+        unstarted.each { |r| release(r[1]) unless seen.include?(r[0]) }
       end
     end
   end
@@ -279,8 +284,8 @@ class Worker
   # Runs one attempt of `row`, records how it ended, and gives back its
   # slot. Only the worker's own cancellation leaves it (the row given
   # back first).
-  def attempt(row: Fetched, tokens: Channel[Nil], freed: Channel[Nil], begun: Atom[Set[Int]]) -> Void
-    begun.update { |b| b.add(row.id) }
+  def attempt(row: Fetched, tokens: Channel[Nil], freed: Channel[Nil], begun: Atom[Set[Int]], key: Int) -> Void
+    begun.update { |b| b.add(key) }
     @running.update { |r| r.add(row.id) }
     begin
       outcome = begin
@@ -290,6 +295,12 @@ class Worker
         raise c
       end
       record(row, outcome)
+    rescue Task::Cancelled => c
+      raise c
+    rescue Exception => e
+      # (Nothing else may leave an attempt: the scope would fail, and the
+      # queue's later attempts never start. The row is rescued later.)
+      STDERR.puts "divider: job #{row.id}: #{e.class.name}: #{e.message}; it is rescued later"
     ensure
       Task.uncancellable do
         @running.update { |r| r.delete(row.id) }
