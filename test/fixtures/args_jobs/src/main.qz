@@ -1,0 +1,62 @@
+# Run by test/args_test.qz (`quarz run`): raises on the first check that
+# fails, prints "ok" at the end.
+def check(cond: Bool, what: String) -> Void
+  raise "failed: #{what}" unless cond
+end
+
+def args_of(repo: Rotor::Repo, id: Int) -> String
+  repo.query("SELECT args::text FROM divider_jobs WHERE id = $1", [id]) { |r| r.string(0) }[0]
+end
+
+def run(repo: Rotor::Repo) -> Void
+  check(Welcome.job_args_type == WelcomeArgs, "job_args_type")
+  check(Welcome.job_unique == Divider::Unique.new(["user_id"], nil), "job_unique")
+  # The keyword form encodes the arguments given (the defaults are the
+  # decoder's), as JSON.
+  a = Welcome.enqueue(repo: repo, user_id: 1)
+  check(a.state == :available, "available")
+  check(args_of(repo, a.id) == "{\"user_id\": 1}", "the arguments given: #{args_of(repo, a.id)}")
+  b = Welcome.enqueue(repo: repo, user_id: 2, note: nil, kind: :sms, inner: Inner.new(["x", "y"], true),
+                      after: 1.hour, priority: 1)
+  check(b.state == :scheduled, "scheduled")
+  check(args_of(repo, b.id) == "{\"kind\": \"sms\", \"note\": null, \"inner\": {\"seen\": true, \"tags\": [\"x\", \"y\"]}, \"user_id\": 2}",
+        "nested, nullable, symbol: #{args_of(repo, b.id)}")
+  check(repo.query("SELECT queue, priority FROM divider_jobs WHERE id = $1", [b.id]) { |r| "#{r.string(0)} #{r.int(1)}" }[0] == "mail 1",
+        "queue and priority")
+  # `enqueue_args` encodes every field.
+  e = Welcome.enqueue_args(repo: repo, args: WelcomeArgs.new(3, "bye"))
+  check(args_of(repo, e.id) == "{\"kind\": \"mail\", \"note\": null, \"inner\": null, \"user_id\": 3, \"template\": \"bye\"}",
+        "enqueue_args: #{args_of(repo, e.id)}")
+  # The inherited form, without the arguments: refused.
+  refused = begin
+    Welcome.enqueue(repo: repo)
+    false
+  rescue ArgumentError
+    true
+  end
+  check(refused, "enqueue without the arguments")
+  check(repo.query("SELECT count(*) FROM divider_jobs WHERE args = '{}'::jsonb") { |r| r.int(0) }[0] == 0, "nothing inserted")
+  # Unique by user_id, whichever form.
+  u = Welcome.enqueue(repo: repo, user_id: 7)
+  check(Welcome.enqueue(repo: repo, user_id: 7, template: "other").id == u.id, "unique, keywords")
+  check(Welcome.enqueue_args(repo: repo, args: WelcomeArgs.new(7)).id == u.id, "unique, enqueue_args")
+  check(Welcome.enqueue(repo: repo, user_id: 8).id != u.id, "another user")
+end
+
+begin
+  PG::Testing.with_cluster do |url|
+    PG::Pool.open(url, 1) do |pool|
+      repo = Rotor::Repo.new(pool: pool)
+      repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_args_versions")
+      begin
+        Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_args_versions").migrate
+        run(repo)
+      ensure
+        repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_args_versions")
+      end
+    end
+  end
+  puts "ok"
+rescue PG::Testing::Unavailable => e
+  puts "unavailable: #{e.message}"
+end

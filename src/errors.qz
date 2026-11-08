@@ -1,0 +1,9 @@
+# What divider raises (beside `ArgumentError` for a wrong argument).
+class Error < StandardError
+end
+
+# A job's stored arguments that do not decode as its class's arguments type
+# (a deploy changed the fields): the job is discarded, not retried. (The
+# worker's decoding, which raises it, comes with quarz-lang/quarz#400.)
+class ArgsError < Error
+end

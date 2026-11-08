@@ -1,0 +1,8 @@
+/.quarz/
+/doc/
+# A library: its users resolve their own (docs/10 §3).
+/Cog.lock
+# This machine's [patch] (docs/10 §2).
+/Cog.local.toml
+# The fixtures' resolutions (test/fixtures/*/Cog.toml).
+/test/fixtures/*/Cog.lock

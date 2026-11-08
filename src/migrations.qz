@@ -1,0 +1,62 @@
+# The schema of the queue, as rotor migrations (`Rotor::Migration`): an
+# application adds `Divider::Migrations.all` to its migrator's list.
+#
+# ```quarz no_run
+# def migrate(repo: Rotor::Repo, app: Array[Type[Rotor::Migration]]) -> Void
+#   Rotor::Migrator.new(repo, app + Divider::Migrations.all).migrate
+# end
+# ```
+#
+# Their versions are fixed (`2026110800000N`), so that every database
+# that ran one knows it by the same number; later versions of divider
+# add migrations, never change these.
+module Migrations
+  # The migrations, in order.
+  def self.all -> Array[Type[Rotor::Migration]] = [CreateJobs]
+end
+
+# The table `divider_jobs` and its indexes: one row a job, from its
+# insertion until it is pruned. States: `scheduled`, `available`,
+# `running`, `completed`, `failed` (a retry pending, at `scheduled_at`),
+# `discarded`, `cancelled`. A running job whose `cancelled_at` is set
+# was asked to stop (`Divider.cancel`).
+class Migrations::CreateJobs < Rotor::Migration
+  version 20261108000001
+
+  def change -> Void
+    create_table :divider_jobs do |t|
+      t.column :class, String
+      t.column :queue, String
+      t.column :args, sql: "jsonb", default: Rotor::SQL.raw("'{}'::jsonb")
+      t.column :priority, Int, default: 5
+      t.column :state, String, default: "available"
+      t.column :scheduled_at, Time, default: Rotor::SQL.raw("now()")
+      t.column :attempt, Int, default: 0
+      t.column :max_attempts, Int, default: 20
+      t.column :unique_key, String, null: true
+      t.column :errors, sql: "jsonb", default: Rotor::SQL.raw("'[]'::jsonb")
+      t.column :node, String, null: true
+      t.column :locked_at, Time, null: true
+      t.column :inserted_at, Time, default: Rotor::SQL.raw("now()")
+      t.column :completed_at, Time, null: true
+      t.column :discarded_at, Time, null: true
+      t.column :cancelled_at, Time, null: true
+      # The fetch: a queue's jobs that are due, by priority then age.
+      t.index [:queue, :state, :priority, :scheduled_at, :id], name: :divider_jobs_fetch
+      # The rescue of jobs whose node stopped beating.
+      t.index [:state, :locked_at], name: :divider_jobs_locked
+      # At most one live job per unique key (`unique` in a job class): a
+      # failed one, whose retry is pending, is live.
+      t.index [:unique_key], unique: true, name: :divider_jobs_unique,
+                             where: "state IN ('scheduled', 'available', 'running', 'failed')"
+      # Pruning.
+      t.index [:state, :completed_at], name: :divider_jobs_prune
+    end
+    execute "ALTER TABLE divider_jobs ADD CONSTRAINT divider_jobs_state CHECK (state IN " +
+            "('scheduled', 'available', 'running', 'completed', 'failed', 'discarded', 'cancelled')), " +
+            "ADD CONSTRAINT divider_jobs_priority CHECK (priority BETWEEN 0 AND 9), " +
+            "ADD CONSTRAINT divider_jobs_attempts CHECK (max_attempts >= 1 AND attempt >= 0)",
+            down: "ALTER TABLE divider_jobs DROP CONSTRAINT divider_jobs_state, " +
+                  "DROP CONSTRAINT divider_jobs_priority, DROP CONSTRAINT divider_jobs_attempts"
+  end
+end

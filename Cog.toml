@@ -1,0 +1,8 @@
+[cog]
+name = "divider"
+version = "0.1.0"
+module = "Divider"
+
+[dependencies]
+Rotor = { git = "https://github.com/quarz-lang/rotor", branch = "main" }
+PG = { git = "https://github.com/quarz-lang/pg", branch = "main" }

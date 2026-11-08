@@ -1,0 +1,15 @@
+# Jobs with arguments (test/args_test.qz runs the program): `args`, the
+# keyword `enqueue`, `enqueue_args` and `unique by:`. A fixture so that
+# the cog's own tests compile while quarz-lang/quarz#397 refuses `args`
+# statements. It is checked against this checkout of divider.
+[cog]
+name = "args_jobs"
+version = "0.1.0"
+
+[dependencies]
+Divider = { git = "https://github.com/quarz-lang/divider", branch = "main" }
+Rotor = { git = "https://github.com/quarz-lang/rotor", branch = "main" }
+PG = { git = "https://github.com/quarz-lang/pg", branch = "main" }
+
+[patch]
+Divider = { path = "../../.." }

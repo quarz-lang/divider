@@ -1,0 +1,12 @@
+# Jobs `quarz check` refuses (test/args_test.qz): each statement's error
+# at compile time. It is checked against this checkout of divider.
+[cog]
+name = "bad_jobs"
+version = "0.1.0"
+
+[dependencies]
+Divider = { git = "https://github.com/quarz-lang/divider", branch = "main" }
+Rotor = { git = "https://github.com/quarz-lang/rotor", branch = "main" }
+
+[patch]
+Divider = { path = "../../.." }
