@@ -1,0 +1,202 @@
+require "test"
+
+class QtPlain < Divider::Job
+end
+
+class QtMail < Divider::Job
+  queue :mail
+  max_attempts 3
+  timeout 90.seconds
+end
+
+class QtOnce < Divider::Job
+  unique
+end
+
+class QtHourly < Divider::Job
+  unique period: 1.hour
+end
+
+# The schema, enqueue (scheduling, priority, the notification at commit,
+# uniqueness) and cancel, against a server (`PG::Testing`).
+class QueueTest < Test::Case
+  # (PG_TEST_URL's server is shared and kept between runs: the table is
+  # dropped before and after.)
+  def with_repo(&: (Rotor::Repo, String) -> Void) -> Void
+    PG::Testing.with_cluster do |url|
+      PG::Pool.open(url, 2) do |pool|
+        repo = Rotor::Repo.new(pool: pool)
+        QueueTest.reset(repo)
+        begin
+          Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_test_versions").migrate
+          yield repo, url
+        ensure
+          QueueTest.reset(repo)
+        end
+      end
+    end
+  rescue PG::Testing::Unavailable => e
+    omit(e.message)
+  end
+
+  def self.reset(repo: Rotor::Repo) -> Void
+    repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_test_versions")
+  end
+
+  # The job `id`'s columns, as text.
+  def row(repo: Rotor::Repo, id: Int) -> Hash[String, String?]
+    cols = ["class", "queue", "args", "priority", "state", "attempt", "max_attempts", "unique_key"]
+    rows = repo.query("SELECT #{cols.map { |c| "#{c}::text" }.join(", ")} FROM divider_jobs WHERE id = $1", [id]) do |r|
+      h: Hash[String, String?] = {}
+      cols.each_with_index { |c, i| h = h.put(c, r.string?(i)) }
+      h
+    end
+    rows[0]
+  end
+
+  def count(repo: Rotor::Repo) -> Int = repo.query("SELECT count(*) FROM divider_jobs") { |r| r.int(0) }[0]
+
+  def test_options
+    assert_equal("default", QtPlain.job_queue)
+    assert_equal(20, QtPlain.job_max_attempts)
+    assert_nil(QtPlain.job_timeout_ms)
+    assert_nil(QtPlain.job_unique)
+    assert_equal("mail", QtMail.job_queue)
+    assert_equal(3, QtMail.job_max_attempts)
+    assert_equal(90_000, QtMail.job_timeout_ms)
+    assert_equal(Divider::Unique.new([], nil), QtOnce.job_unique)
+    assert_equal(Divider::Unique.new([], 3_600_000), QtHourly.job_unique)
+  end
+
+  def test_schema_migrates_both_ways
+    with_repo do |repo, _|
+      cols = repo.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'divider_jobs' ORDER BY ordinal_position") { |r| r.string(0) }
+      assert_equal(["id", "class", "queue", "args", "priority", "state", "scheduled_at", "attempt", "max_attempts", "unique_key",
+                    "errors", "node", "locked_at", "inserted_at", "completed_at", "discarded_at", "cancelled_at"], cols)
+      indexes = repo.query("SELECT indexname FROM pg_indexes WHERE tablename = 'divider_jobs' ORDER BY indexname") { |r| r.string(0) }
+      assert_equal(["divider_jobs_fetch", "divider_jobs_locked", "divider_jobs_pkey", "divider_jobs_prune", "divider_jobs_unique"], indexes)
+      # The constraints hold.
+      assert_raise(PG::Error) { repo.exec("INSERT INTO divider_jobs (class, queue, state) VALUES ('X', 'q', 'lost')") }
+      assert_raise(PG::Error) { repo.exec("INSERT INTO divider_jobs (class, queue, priority) VALUES ('X', 'q', 10)") }
+      m = Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_test_versions")
+      assert_equal([20261108000001], m.rollback(steps: 1))
+      assert_equal(0, repo.query("SELECT count(*) FROM information_schema.tables WHERE table_name = 'divider_jobs'") { |r| r.int(0) }[0])
+    end
+  end
+
+  def test_enqueue_now_and_later
+    with_repo do |repo, _|
+      e = QtMail.enqueue(repo)
+      assert_equal(:available, e.state)
+      assert_equal({"class" => "QtMail", "queue" => "mail", "args" => "{}", "priority" => "5", "state" => "available",
+                    "attempt" => "0", "max_attempts" => "3", "unique_key" => nil}, row(repo, e.id))
+      later = QtPlain.enqueue(repo, after: 1.hour, priority: 0)
+      assert_equal(:scheduled, later.state)
+      assert_true(later.scheduled_at > e.scheduled_at + 59.minutes)
+      assert_equal("0", row(repo, later.id)["priority"])
+      at = Time.utc(2030, 1, 2, 3, 4, 5)
+      fixed = QtPlain.enqueue(repo, at: at)
+      assert_equal([:scheduled, at], [fixed.state, fixed.scheduled_at])
+      past = QtPlain.enqueue(repo, at: Time.utc(2020, 1, 1))
+      assert_equal(:available, past.state)
+      assert_raise(ArgumentError) { QtPlain.enqueue(repo, at: at, after: 1.minute) }
+      assert_raise(ArgumentError) { QtPlain.enqueue(repo, priority: 10) }
+      assert_raise(ArgumentError) { QtPlain.enqueue(repo, priority: -1) }
+      assert_raise(ArgumentError) { QtPlain.enqueue(repo, after: 0.seconds - 1.second) }
+      assert_equal(4, count(repo))
+    end
+  end
+
+  def test_notification_at_commit_and_none_after_rollback
+    with_repo do |repo, url|
+      listener = PG.connect(url)
+      begin
+        listener.listen("divider")
+        repo.transaction do |tx|
+          QtMail.enqueue(tx)
+          # (Not before the commit.)
+          assert_nil(listener.wait_for_notify(timeout: 200.ms))
+        end
+        n = listener.wait_for_notify(timeout: 5.seconds)
+        assert_equal(Divider::Queue::CHANNEL, n&.channel)
+        assert_equal("mail", n&.payload)
+        # A scheduled job: no notification (the workers poll for it).
+        QtMail.enqueue(repo, after: 1.hour)
+        assert_nil(listener.wait_for_notify(timeout: 200.ms))
+        # Rolled back: no row, no notification.
+        assert_raise(RuntimeError) do
+          repo.transaction do |tx|
+            QtMail.enqueue(tx)
+            raise "no"
+          end
+        end
+        assert_nil(listener.wait_for_notify(timeout: 200.ms))
+        assert_equal(2, count(repo))
+      ensure
+        listener.close
+      end
+    end
+  end
+
+  def test_unique
+    with_repo do |repo, _|
+      a = QtOnce.enqueue(repo)
+      b = QtOnce.enqueue(repo, after: 1.hour)
+      assert_equal([a.id, :available], [b.id, b.state])
+      assert_equal(1, count(repo))
+      # Another class: its own key.
+      h = QtHourly.enqueue(repo)
+      assert_equal(h.id, QtHourly.enqueue(repo).id)
+      assert_false(row(repo, h.id)["unique_key"] == row(repo, a.id)["unique_key"])
+      # Once the job is no longer live, the key is free.
+      assert_equal(:cancelled, Divider.cancel(repo, a.id))
+      c = QtOnce.enqueue(repo)
+      assert_false(c.id == a.id)
+      # A running job holds the key too.
+      repo.exec("UPDATE divider_jobs SET state = 'running' WHERE id = $1", [c.id])
+      d = QtOnce.enqueue(repo)
+      assert_equal([c.id, :running], [d.id, d.state])
+      repo.exec("UPDATE divider_jobs SET state = 'completed' WHERE id = $1", [c.id])
+      assert_false(QtOnce.enqueue(repo).id == c.id)
+    end
+  end
+
+  def test_unique_by_arguments
+    with_repo do |repo, _|
+      u = Divider::Unique.new(["user_id"], nil)
+      job = ->(args: String) { Divider::Queue::New.new("QtArgs", "default", args, 5, nil, nil, 20, u) }
+      a = Divider::Queue.insert(repo, job.call("{\"user_id\": 1, \"template\": \"a\"}"))
+      # The same user, another template: the same job.
+      assert_equal(a.id, Divider::Queue.insert(repo, job.call("{\"template\": \"b\", \"user_id\": 1}")).id)
+      # Another user: another job.
+      b = Divider::Queue.insert(repo, job.call("{\"user_id\": 2, \"template\": \"a\"}"))
+      assert_false(a.id == b.id)
+      # A key differs by class.
+      other = Divider::Queue.insert(repo, Divider::Queue::New.new("QtOther", "default", "{\"user_id\": 1}", 5, nil, nil, 20, u))
+      assert_false(other.id == a.id)
+    end
+  end
+
+  def test_cancel
+    with_repo do |repo, _|
+      a = QtPlain.enqueue(repo)
+      s = QtPlain.enqueue(repo, after: 1.hour)
+      assert_equal(:cancelled, Divider.cancel(repo, a.id))
+      assert_nil(Divider.cancel(repo, a.id))
+      assert_equal(:cancelled, Divider.cancel(repo, s.id))
+      assert_equal("cancelled", row(repo, s.id)["state"])
+      f = QtPlain.enqueue(repo)
+      repo.exec("UPDATE divider_jobs SET state = 'failed' WHERE id = $1", [f.id])
+      assert_equal(:cancelled, Divider.cancel(repo, f.id))
+      r = QtPlain.enqueue(repo)
+      repo.exec("UPDATE divider_jobs SET state = 'running' WHERE id = $1", [r.id])
+      assert_equal(:requested, Divider.cancel(repo, r.id))
+      assert_equal("running", row(repo, r.id)["state"])
+      assert_nil(Divider.cancel(repo, r.id))
+      c = QtPlain.enqueue(repo)
+      repo.exec("UPDATE divider_jobs SET state = 'completed' WHERE id = $1", [c.id])
+      assert_nil(Divider.cancel(repo, c.id))
+      assert_nil(Divider.cancel(repo, 999_999))
+    end
+  end
+end

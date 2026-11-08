@@ -1,0 +1,3 @@
+# What divider raises (beside `ArgumentError` for a wrong argument).
+class Error < StandardError
+end

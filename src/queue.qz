@@ -1,0 +1,66 @@
+# :nodoc:
+# The queue's SQL: inserting a job (with its notification and its
+# unique key).
+module Queue
+  # The channel `enqueue` notifies, with the queue's name.
+  CHANNEL = "divider"
+
+  # A job to insert: its class's name, queue, arguments (JSON text of an
+  # object), priority, when it is due (`at`, or `after` from the
+  # database's now, or now), attempts and uniqueness.
+  data New = (class_name: String, queue: String, args: String, priority: Int, at: Time?, after: Duration?,
+           max_attempts: Int, unique: Unique?)
+
+  # Inserts `job`, in `repo`'s transaction when it is bound to one, and
+  # notifies the channel `divider` with the queue's name (delivered at
+  # commit) when it is due now. With `unique`, a live job of the same key
+  # is given instead, and nothing is inserted.
+  def self.insert(repo: Rotor::Repo, job: New) -> Enqueued
+    raise ArgumentError.new("enqueue takes at: or after:, not both") if job.at && job.after
+    p = job.priority
+    raise ArgumentError.new("a priority is 0 to 9, not #{p}") if p < 0 || p > 9
+    delay = job.after
+    after_ms = delay ? delay.to_ms : nil
+    raise ArgumentError.new("after: is not negative, not #{delay}") if after_ms && after_ms < 0
+    u = job.unique
+    key = u ? Queue.key(repo, job, u) : nil
+    3.times do
+      found = repo.query(INSERT, [job.class_name, job.queue, job.args, p, job.at, after_ms, job.max_attempts, key]) do |r|
+        Enqueued.new(r.int(0), r.string(1).to_sym, r.time(2))
+      end
+      return found[0] unless found.empty?
+      # (A live job holds the key.)
+      live = repo.query("SELECT id, state, scheduled_at FROM divider_jobs WHERE unique_key = $1 " +
+                        "AND state IN ('scheduled', 'available', 'running')", [key]) do |r|
+        Enqueued.new(r.int(0), r.string(1).to_sym, r.time(2))
+      end
+      return live[0] unless live.empty?
+      # (It ended between the two statements: insert again.)
+    end
+    raise Error.new("enqueue: the unique key of #{job.class_name} kept changing hands")
+  end
+
+  # The insertion: due at `$5`, or `$6` milliseconds from now, or now;
+  # `scheduled` when that is later than now, else `available` and the
+  # queue notified. Nothing on a conflict of the unique key.
+  INSERT = "WITH due AS (SELECT COALESCE($5::timestamptz, now() + COALESCE($6::bigint, 0) * interval '1 millisecond') AS at), " +
+           "ins AS (INSERT INTO divider_jobs (class, queue, args, priority, state, scheduled_at, max_attempts, unique_key) " +
+           "SELECT $1, $2, $3::jsonb, $4, CASE WHEN due.at > now() THEN 'scheduled' ELSE 'available' END, due.at, $7, $8 FROM due " +
+           "ON CONFLICT (unique_key) WHERE state IN ('scheduled', 'available', 'running') DO NOTHING " +
+           "RETURNING id, state, scheduled_at) " +
+           "SELECT ins.id, ins.state, ins.scheduled_at, " +
+           "CASE WHEN ins.state = 'available' THEN (SELECT 1 FROM pg_notify('divider', $2)) END FROM ins"
+
+  # The unique key of `job`: the SHA-256 (hex) of its class, the values
+  # of the arguments `u.by` (as JSON, keys sorted), and the period's
+  # number by the database's clock.
+  def self.key(repo: Rotor::Repo, job: New, u: Unique) -> String
+    keys = repo.query(KEY, [job.class_name, job.args, JSON.generate(u.by), u.period_ms]) { |r| r.string(0) }
+    keys[0]
+  end
+
+  KEY = "SELECT encode(sha256(convert_to($1 || chr(10) || " +
+        "COALESCE((SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each($2::jsonb) e " +
+        "WHERE e.key IN (SELECT jsonb_array_elements_text($3::jsonb)))::text, '{}') || chr(10) || " +
+        "COALESCE(floor(extract(epoch FROM now()) * 1000 / $4::bigint)::bigint::text, ''), 'UTF8')), 'hex')"
+end

@@ -1,0 +1,59 @@
+# Tests the cog against Quarz's main branch, built from source, and a
+# PostgreSQL server (the queue's tests read PG_TEST_URL).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so that a change on Quarz's main that breaks the cog shows.
+    - cron: "17 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: quarz-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # SCRAM-SHA-256: the image's default for a role with a password.
+      PG_TEST_URL: postgres://postgres:quarz-ci@localhost:5432/postgres
+      # Tasks on several workers, as the worker's tests need to show.
+      QUARZ_THREADS: 4
+    steps:
+      - name: Check out this cog
+        uses: actions/checkout@v7
+      - name: Check out Quarz (main), to build it
+        uses: actions/checkout@v7
+        with:
+          repository: quarz-lang/quarz
+          path: .quarz
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .quarz
+      - name: Build Quarz
+        run: |
+          cargo build --release --manifest-path .quarz/Cargo.toml
+          echo "$GITHUB_WORKSPACE/.quarz/target/release" >> "$GITHUB_PATH"
+      - name: Check
+        run: quarz check
+      - name: Test (interpreted)
+        run: quarz test
+      - name: Test (compiled)
+        run: quarz test --release
+      - name: Doc examples
+        run: quarz test --doc
+      - name: Docs
+        run: quarz doc --check
