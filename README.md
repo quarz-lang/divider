@@ -21,7 +21,7 @@ its comments the decisions taken while it was built.
 `Divider::Migrations.all` are rotor migrations (`divider_jobs`, and
 `divider_cron` for the cron entries): add them to your migrator's list.
 
-```quarz no_run
+```crystal
 def migrate(repo: Rotor::Repo, app: Array[Type[Rotor::Migration]]) -> Void
   Rotor::Migrator.new(repo, app + Divider::Migrations.all).migrate
 end
@@ -29,7 +29,7 @@ end
 
 ## Jobs
 
-```quarz no_run
+```crystal
 data WelcomeArgs = (user_id: Int, template: String = "welcome")
 
 class SendWelcome < Divider::Job
@@ -98,7 +98,7 @@ end
 
 ## Running jobs
 
-```quarz no_run
+```crystal
 worker = Divider::Worker.new(ENV["DATABASE_URL"], jobs: [SendWelcome, Cleanup],
                              queues: {default: 10, mail: 5})
 Signal.trap(:TERM) { worker.shutdown(25.seconds) }
@@ -133,7 +133,7 @@ worker.run      # or Task.spawn { worker.run } beside an HTTP server
 
 ## Recurring jobs
 
-```quarz no_run
+```crystal
 cron = Divider::Cron.new([Divider::Cron.entry("*/5 * * * *", Cleanup),
                           Divider::Cron.entry("0 3 * * *", SendWelcome, user_id: 1, template: "digest")])
 Divider::Worker.new(url, jobs: [Cleanup, SendWelcome], queues: {default: 10, mail: 5}, cron: cron).run
@@ -150,7 +150,7 @@ checked when the job is decoded.
 
 ## Testing
 
-```quarz no_run
+```crystal
 class SignupTest < Test::Case
   include Divider::Testing::Assertions
 
