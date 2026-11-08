@@ -62,7 +62,6 @@ end
 
 def calls(repo: Rotor::Repo) -> Void
   Fine.enqueue(repo: repo, user_id: "1")
-  Fine.enqueue(repo: repo)
   Fine.enqueue(repo: repo, user_id: 1, colour: "red")
   Fine.enqueue_args(repo: repo, args: 3)
 end

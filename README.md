@@ -41,7 +41,10 @@ A job with `args` is enqueued with keywords: `repo:`, its arguments
 class only (`Type#fields` shows a nullable field as `Object` and an
 `Array[Int]` as `Array`: quarz-lang/quarz#401), so a value of the wrong
 type there is found when the worker decodes the job (`Divider::ArgsError`,
-discarded). `enqueue_args` takes an `Args` value, checked fully.
+discarded). `enqueue_args` takes an `Args` value, checked fully. For the
+same reason `args` checks that a field can be encoded by its outer class
+only: a nullable or union field, or a collection's elements, of a class
+that cannot (`Pen?`, `Array[Pen]`), is found at decoding too.
 
 ## License
 

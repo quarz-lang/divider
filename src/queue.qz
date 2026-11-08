@@ -31,7 +31,7 @@ module Queue
       return found[0] unless found.empty?
       # (A live job holds the key.)
       live = repo.query("SELECT id, state, scheduled_at FROM divider_jobs WHERE unique_key = $1 " +
-                        "AND state IN ('scheduled', 'available', 'running')", [key]) do |r|
+                        "AND state IN ('scheduled', 'available', 'running', 'failed')", [key]) do |r|
         Enqueued.new(r.int(0), r.string(1).to_sym, r.time(2))
       end
       return live[0] unless live.empty?
@@ -46,7 +46,7 @@ module Queue
   INSERT = "WITH due AS (SELECT COALESCE($5::timestamptz, now() + COALESCE($6::bigint, 0) * interval '1 millisecond') AS at), " +
            "ins AS (INSERT INTO divider_jobs (class, queue, args, priority, state, scheduled_at, max_attempts, unique_key) " +
            "SELECT $1, $2, $3::jsonb, $4, CASE WHEN due.at > now() THEN 'scheduled' ELSE 'available' END, due.at, $7, $8 FROM due " +
-           "ON CONFLICT (unique_key) WHERE state IN ('scheduled', 'available', 'running') DO NOTHING " +
+           "ON CONFLICT (unique_key) WHERE state IN ('scheduled', 'available', 'running', 'failed') DO NOTHING " +
            "RETURNING id, state, scheduled_at) " +
            "SELECT ins.id, ins.state, ins.scheduled_at, " +
            "CASE WHEN ins.state = 'available' THEN (SELECT 1 FROM pg_notify('divider', $2)) END FROM ins"

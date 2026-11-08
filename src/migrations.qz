@@ -45,9 +45,10 @@ class Migrations::CreateJobs < Rotor::Migration
       t.index [:queue, :state, :priority, :scheduled_at, :id], name: :divider_jobs_fetch
       # The rescue of jobs whose node stopped beating.
       t.index [:state, :locked_at], name: :divider_jobs_locked
-      # At most one live job per unique key (`unique` in a job class).
+      # At most one live job per unique key (`unique` in a job class): a
+      # failed one, whose retry is pending, is live.
       t.index [:unique_key], unique: true, name: :divider_jobs_unique,
-                             where: "state IN ('scheduled', 'available', 'running')"
+                             where: "state IN ('scheduled', 'available', 'running', 'failed')"
       # Pruning.
       t.index [:state, :completed_at], name: :divider_jobs_prune
     end

@@ -71,11 +71,14 @@ abstract class Job
   # A field's class is checked here: `Int`, `Integer`, `Float`,
   # `String`, `Bool`, `Symbol`, `Time`, `Bytes`, `Array`, `Hash`, `Set`,
   # another `data` type of such fields, or a nullable or union one
-  # (which `Type#fields` shows as `Object`). The keywords are typed by
-  # those classes only, without type arguments or nullability
-  # (quarz-lang/quarz#401): `enqueue_args` checks the value fully, and a
-  # value of the wrong type given to `enqueue` is found when the worker
-  # decodes it (`Divider::ArgsError`). A field cannot be named `repo`,
+  # (which `Type#fields` shows as `Object`). Only the outer class is
+  # seen (quarz-lang/quarz#401): a nullable or union field and the
+  # elements of a collection are not checked here (`Pen?` or
+  # `Array[Pen]` passes, and is found when the worker decodes the job);
+  # the keywords are typed by those classes only, without type arguments
+  # or nullability, while `enqueue_args` checks its value fully against
+  # the type. A value the decoding refuses fails the job with
+  # `Divider::ArgsError`. A field cannot be named `repo`,
   # `at`, `after` or `priority`, and `args` comes once.
   static def self.args[A](type: Type[A]) -> Void
     fields = type.fields
@@ -147,10 +150,14 @@ abstract class Job
   # The classes a job's argument may have, as `Type#fields` shows them.
   ENCODABLE = [Int, Integer, Float, String, Bool, Symbol, Time, Bytes, Array, Hash, Set, Object]
 
-  # At most one live job (scheduled, available or running) of the class
-  # with the same values of the arguments `by` within each `period`
-  # (from the epoch, by the database's clock), or ever without one:
-  # `enqueue` gives the existing job's `Enqueued` instead of inserting.
+  # At most one live job (scheduled, available, running, or failed with
+  # a retry pending) of the class with the same values of the arguments
+  # `by` within each `period` (from the epoch, by the database's clock),
+  # or ever without one: `enqueue` gives the existing job's `Enqueued`
+  # instead of inserting. Under REPEATABLE READ or SERIALIZABLE, an
+  # `enqueue` whose key a transaction committed since the snapshot holds
+  # raises PostgreSQL's serialization failure instead: retry the
+  # transaction, as for any such conflict.
   # `by` names fields of the job's `args` that have no default (a field
   # left to its default is absent from the row's JSON), so `unique`
   # comes after `args`.
@@ -173,7 +180,14 @@ abstract class Job
 
   # Inserts the job, due now, at `at`, or `after` from the database's
   # now (not both), with `priority` (0, the first, to 9; 5 by default).
+  # For a job without arguments: one with `args` takes them as keywords
+  # (`enqueue(repo: repo, user_id: 42)`), and calling this form on it
+  # (which `enqueue(repo: repo)` without its arguments also resolves to)
+  # raises `ArgumentError`.
   def self.enqueue(repo: Rotor::Repo, *, at: Time? = nil, after: Duration? = nil, priority: Int = 5) -> Enqueued
+    if t = job_args_type
+      raise ArgumentError.new("#{name}.enqueue takes its arguments (#{t.name}) as keywords, or an #{t.name} with enqueue_args")
+    end
     Queue.insert(repo, Queue::New.new(name, job_queue, "{}", priority, at, after, job_max_attempts, job_unique))
   end
 end
@@ -184,20 +198,20 @@ data Unique = (by: Array[String], period_ms: Int?)
 
 # A job `enqueue` inserted, or the live job it found in its place
 # (`unique`): its id, its state (`:scheduled` or `:available`, or
-# `:running` for one found) and when it is due.
+# `:running` or `:failed` for one found) and when it is due.
 data Enqueued = (id: Int, state: Symbol, scheduled_at: Time)
 
 # Cancels the job `id`: one scheduled, available or failed (a retry
 # pending) becomes `cancelled` (`:cancelled`); a running one is asked to
 # stop (`:requested`: its `cancelled_at` is set, which the job sees as
 # `cancel_requested?`; it ends `completed` if it finishes anyway,
-# `cancelled` otherwise, not retried). Nil for a job that does not exist
-# or has ended, or whose cancellation was already requested.
+# `cancelled` otherwise, not retried; asked again, `:requested` again,
+# the first request's time kept). Nil for a job that does not exist or
+# has ended.
 public def cancel(repo: Rotor::Repo, id: Int) -> Symbol?
   states = repo.query("UPDATE divider_jobs SET state = CASE WHEN state = 'running' THEN state ELSE 'cancelled' END, " +
-                      "cancelled_at = now() " +
-                      "WHERE id = $1 AND (state IN ('scheduled', 'available', 'failed') " +
-                      "OR (state = 'running' AND cancelled_at IS NULL)) RETURNING state", [id]) { |r| r.string(0) }
+                      "cancelled_at = CASE WHEN state = 'running' THEN COALESCE(cancelled_at, now()) ELSE now() END " +
+                      "WHERE id = $1 AND state IN ('scheduled', 'available', 'failed', 'running') RETURNING state", [id]) { |r| r.string(0) }
   s = states.first?
   return nil if s.nil?
   s == "running" ? :requested : :cancelled

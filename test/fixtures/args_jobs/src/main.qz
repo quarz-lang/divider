@@ -27,6 +27,14 @@ def run(repo: Rotor::Repo) -> Void
   e = Welcome.enqueue_args(repo: repo, args: WelcomeArgs.new(3, "bye"))
   check(args_of(repo, e.id) == "{\"kind\": \"mail\", \"note\": null, \"inner\": null, \"user_id\": 3, \"template\": \"bye\"}",
         "enqueue_args: #{args_of(repo, e.id)}")
+  # The inherited form, without the arguments: refused.
+  refused = begin
+    Welcome.enqueue(repo: repo)
+    false
+  rescue ArgumentError
+    true
+  end
+  check(refused, "enqueue without the arguments")
   # Unique by user_id, whichever form.
   u = Welcome.enqueue(repo: repo, user_id: 7)
   check(Welcome.enqueue(repo: repo, user_id: 7, template: "other").id == u.id, "unique, keywords")

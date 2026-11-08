@@ -29,12 +29,13 @@ class ArgsTest < Test::Case
     assert_match(/main\.qz:41:3: error: `args` raised ArgumentError: Twice declares `args` twice/, text)
     assert_match(/main\.qz:46:3: error: `unique` raised ArgumentError: unique by: UniqueUnknown has no argument user/, text)
     assert_match(/main\.qz:51:3: error: `unique` raised ArgumentError: unique by: the argument template has a default/, text)
-    # The calls: a keyword of the wrong class, a missing one, an unknown
-    # one, and `enqueue_args` with something else than the job's `Args`.
+    # The calls: a keyword of the wrong class, an unknown one, and
+    # `enqueue_args` with something else than the job's `Args`. (Without
+    # the arguments, `enqueue(repo: repo)` is the inherited form, which
+    # raises: test/fixtures/args_jobs.)
     assert_match(/main\.qz:64:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo, user_id: String\)/, text)
-    assert_match(/main\.qz:65:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo\)/, text)
-    assert_match(/main\.qz:66:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo, user_id: Int, colour: String\)/, text)
-    assert_match(/main\.qz:67:39: error: argument `args` of enqueue_args\(.*\) expects Good but found Int/, text)
+    assert_match(/main\.qz:65:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo, user_id: Int, colour: String\)/, text)
+    assert_match(/main\.qz:66:39: error: argument `args` of enqueue_args\(.*\) expects Good but found Int/, text)
   end
 
   def test_jobs_with_arguments

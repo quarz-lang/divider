@@ -156,6 +156,10 @@ class QueueTest < Test::Case
       repo.exec("UPDATE divider_jobs SET state = 'running' WHERE id = $1", [c.id])
       d = QtOnce.enqueue(repo)
       assert_equal([c.id, :running], [d.id, d.state])
+      # A failed job, whose retry is pending, too.
+      repo.exec("UPDATE divider_jobs SET state = 'failed' WHERE id = $1", [c.id])
+      f = QtOnce.enqueue(repo)
+      assert_equal([c.id, :failed], [f.id, f.state])
       repo.exec("UPDATE divider_jobs SET state = 'completed' WHERE id = $1", [c.id])
       assert_false(QtOnce.enqueue(repo).id == c.id)
     end
@@ -192,7 +196,10 @@ class QueueTest < Test::Case
       repo.exec("UPDATE divider_jobs SET state = 'running' WHERE id = $1", [r.id])
       assert_equal(:requested, Divider.cancel(repo, r.id))
       assert_equal("running", row(repo, r.id)["state"])
-      assert_nil(Divider.cancel(repo, r.id))
+      first = repo.query("SELECT cancelled_at FROM divider_jobs WHERE id = $1", [r.id]) { |x| x.time(0) }[0]
+      # Asked again: requested again, the first request's time kept.
+      assert_equal(:requested, Divider.cancel(repo, r.id))
+      assert_equal(first, repo.query("SELECT cancelled_at FROM divider_jobs WHERE id = $1", [r.id]) { |x| x.time(0) }[0])
       c = QtPlain.enqueue(repo)
       repo.exec("UPDATE divider_jobs SET state = 'completed' WHERE id = $1", [c.id])
       assert_nil(Divider.cancel(repo, c.id))
