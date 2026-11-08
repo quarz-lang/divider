@@ -14,9 +14,7 @@ Divider = { git = "https://github.com/quarz-lang/divider", branch = "main" }
 ```
 
 The design is [divider#1](https://github.com/quarz-lang/divider/issues/1),
-its comments the decisions taken while it was built. **Not yet:** running a
-job that has arguments (`args`) waits for quarz-lang/quarz#409 (decoding
-them into the job's `data` type); such jobs can be enqueued already.
+its comments the decisions taken while it was built.
 
 ## The schema
 
@@ -38,7 +36,7 @@ class SendWelcome < Divider::Job
   queue :mail                    # default :default
   max_attempts 10                # default 20
   timeout 2.minutes              # an attempt longer than that fails
-  args WelcomeArgs               # the arguments: a data type of the class's own
+  job_args WelcomeArgs           # the arguments: a data type of the class's own
   unique by: [:user_id], period: 1.hour
 
   def perform(args: WelcomeArgs, job: Divider::Context) -> Void
@@ -70,15 +68,17 @@ end
   job exists, and a worker hears of it, only once that commits. `at:` is a
   time, `after:` a delay from the database's now; `priority:` 0 (first) to
   9, 5 by default.
-- A job with `args` is enqueued with keywords: `repo:`, its arguments
+- A job with `job_args` is enqueued with keywords: `repo:`, its arguments
   (optional where the data type has a default), and the scheduling ones;
   an argument named `repo`, `at`, `after` or `priority` is refused. Those
   keywords are checked by their outer class only (`Type#fields` shows a
-  nullable field as `Object` and `Array[Int]` as `Array`: quarz-lang/quarz#401),
-  and `args` checks a field's encodability by its outer class only; a
+  nullable field as `Object` and `Array[Int]` as `Array`, and a keyword
+  for a collection is typed `Object`: quarz-lang/quarz#401),
+  and `job_args` checks a field's encodability by its outer class only; a
   value that does not fit is found when the worker decodes the job
-  (`Divider::ArgsError`, discarded). `enqueue_args` takes an `Args` value,
-  checked fully. The argument-less `enqueue(repo)` a job with `args`
+  (`Divider::ArgsError`, discarded, the error naming where: a deploy that
+  changes an `Args` type should add fields with defaults). `enqueue_args` takes an `Args` value,
+  checked fully. The argument-less `enqueue(repo)` a job with `job_args`
   inherits raises `ArgumentError`.
 - `unique` keeps one live job (scheduled, available, running, or failed
   with a retry pending) per class, values of the `by` arguments (fields

@@ -2,13 +2,9 @@ require "test"
 
 # Jobs' statements checked at compile time (test/fixtures/bad_jobs), and
 # jobs with arguments (test/fixtures/args_jobs, a program run here):
-# fixtures, checked by `quarz` on the PATH or by $QUARZ, so that this
-# suite compiles while quarz-lang/quarz#397 refuses every `args`
-# statement (its generated `enqueue` inserts, which the statement's
-# compile-time reach counts).
+# fixtures, checked by `quarz` on the PATH or by $QUARZ (the errors are
+# compile errors, and the program needs a server).
 class ArgsTest < Test::Case
-  BLOCKED = /`args` reaches .* which cannot run at compile time/
-
   def quarz(dir: String, command: String) -> Process::Output
     Process.sh("cd test/fixtures/#{dir} && exec \"${QUARZ:-quarz}\" #{command} 2>&1")
   end
@@ -20,13 +16,12 @@ class ArgsTest < Test::Case
     assert_match(/main\.qz:12:3: error: `queue` raised ArgumentError: a queue's name is letters, digits and _, not "no-dash"/, text)
     assert_match(/main\.qz:16:3: error: `max_attempts` raised ArgumentError: max_attempts is 1 or more, not 0/, text)
     assert_match(/main\.qz:20:3: error: `timeout` raised ArgumentError: a timeout is at least 1ms, not 0s/, text)
-    assert_match(/main\.qz:55:3: error: `unique` raised ArgumentError: unique by: UniqueFirst has no argument user_id \(`args` comes first\)/, text)
-    omit("quarz-lang/quarz#397: `args` statements are refused at compile time") if text.match?(BLOCKED)
-    assert_match(/main\.qz:24:3: error: `args` raised ArgumentError: Empty has no fields/, text)
-    assert_match(/main\.qz:28:3: error: `args` raised ArgumentError: Named#priority: a job's argument cannot be named priority/, text)
-    assert_match(/main\.qz:32:3: error: `args` raised ArgumentError: Holding#pen: a Pen cannot be a job's argument/, text)
-    assert_match(/main\.qz:36:3: error: `args` raised ArgumentError: Deep#inner\.pen: a Pen cannot be a job's argument/, text)
-    assert_match(/main\.qz:41:3: error: `args` raised ArgumentError: Twice declares `args` twice/, text)
+    assert_match(/main\.qz:55:3: error: `unique` raised ArgumentError: unique by: UniqueFirst has no argument user_id \(`job_args` comes first\)/, text)
+    assert_match(/main\.qz:24:3: error: `job_args` raised ArgumentError: Empty has no fields/, text)
+    assert_match(/main\.qz:28:3: error: `job_args` raised ArgumentError: Named#priority: a job's argument cannot be named priority/, text)
+    assert_match(/main\.qz:32:3: error: `job_args` raised ArgumentError: Holding#pen: a Pen cannot be a job's argument/, text)
+    assert_match(/main\.qz:36:3: error: `job_args` raised ArgumentError: Deep#inner\.pen: a Pen cannot be a job's argument/, text)
+    assert_match(/main\.qz:41:3: error: `job_args` raised ArgumentError: Twice declares `job_args` twice/, text)
     assert_match(/main\.qz:46:3: error: `unique` raised ArgumentError: unique by: UniqueUnknown has no argument user/, text)
     assert_match(/main\.qz:51:3: error: `unique` raised ArgumentError: unique by: the argument template has a default/, text)
     # The calls: a keyword of the wrong class, an unknown one, and
@@ -36,11 +31,17 @@ class ArgsTest < Test::Case
     assert_match(/main\.qz:64:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo, user_id: String\)/, text)
     assert_match(/main\.qz:65:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo, user_id: .*, colour: String\)/, text)
     assert_match(/main\.qz:66:39: error: argument `args` of enqueue_args\(.*\) -> Divider::Enqueued expects Good but found Int/, text)
+    # A job of arguments without `perform(args, job)`, and a subclass of
+    # one declaring others.
+    assert_match(/main\.qz:78:3: error: `method_ref\(:perform\)`: the handle to `NoPerform#perform` is a `Meta::Method\[NoPerform, \(Good, Divider::Context\) -> Void\]`, but `NoPerform` has no method `perform` of that type/, text)
+    assert_match(/main\.qz:82:3: error: `job_args` raised ArgumentError: Redeclared inherits the arguments of a job with `job_args`: a subclass cannot declare others/, text)
+    # (`Fine` and the others that declare `Good` are refused at nothing
+    # else: their `perform` is GoodBase's.)
+    refute_match(/main\.qz:(40|45|50|56|60):3: error: `method_ref/, text)
   end
 
   def test_jobs_with_arguments
     out = quarz("args_jobs", "run")
-    omit("quarz-lang/quarz#397: `args` statements are refused at compile time") if out.stdout.match?(BLOCKED)
     unavailable = out.stdout.lines.find { |l| l.start_with?("unavailable: ") }
     omit(unavailable.strip) if unavailable
     assert(out.success?, out.stdout)

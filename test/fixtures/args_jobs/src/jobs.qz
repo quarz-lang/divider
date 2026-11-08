@@ -4,6 +4,22 @@ data WelcomeArgs = (user_id: Int, template: String = "welcome", note: String? = 
 
 class Welcome < Divider::Job
   queue :mail
-  args WelcomeArgs
+  job_args WelcomeArgs
   unique by: [:user_id]
+
+  def perform(args: WelcomeArgs, job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO welcome_runs (job_id, args) VALUES ($1, $2)", [job.id, args.inspect])
+  end
+end
+
+# Every kind of field a job's arguments may have.
+data AllArgs = (i: Int, f: Float, s: String, b: Bool, t: Time, by: Bytes, sym: Symbol, n: Int?, xs: Array[Int],
+                h: Hash[String, Int], set: Set[String], inner: Inner, absent: String = "default")
+
+class AllTypes < Divider::Job
+  job_args AllArgs
+
+  def perform(args: AllArgs, job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO welcome_runs (job_id, args) VALUES ($1, $2)", [job.id, args.inspect])
+  end
 end

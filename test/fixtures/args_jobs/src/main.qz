@@ -41,18 +41,52 @@ def run(repo: Rotor::Repo) -> Void
   check(Welcome.enqueue(repo: repo, user_id: 7, template: "other").id == u.id, "unique, keywords")
   check(Welcome.enqueue_args(repo: repo, args: WelcomeArgs.new(7)).id == u.id, "unique, enqueue_args")
   check(Welcome.enqueue(repo: repo, user_id: 8).id != u.id, "another user")
+  # Run: each decodes its arguments, defaults filling what the row does
+  # not hold. (`b` is due in an hour: not run.)
+  repo.exec("CREATE TABLE welcome_runs (job_id bigint PRIMARY KEY, args text NOT NULL)")
+  ran = Divider::Testing.drain(repo, jobs: [Welcome])
+  check(ran == 4, "drained #{ran}")
+  check(run_of(repo, a.id) == WelcomeArgs.new(1).inspect, "decoded with defaults: #{run_of(repo, a.id)}")
+  e = Welcome.enqueue_args(repo: repo, args: WelcomeArgs.new(3, "bye", "n", Inner.new(["t"], false), :sms))
+  Divider::Testing.drain(repo, jobs: [Welcome])
+  check(run_of(repo, e.id) == WelcomeArgs.new(3, "bye", "n", Inner.new(["t"], false), :sms).inspect, "decoded: #{run_of(repo, e.id)}")
+  # Every kind of field round-trips.
+  all = AllArgs.new(1, 2.5, "s", true, Time.utc(2026, 11, 8, 1, 2, 3) + 456.ms, Bytes[0, 255, 7], :sym, nil, [1, 2],
+                    {"k" => 3}, Set["a", "b"], Inner.new(["x"], true))
+  t = AllTypes.enqueue_args(repo: repo, args: all)
+  # The keyword form too, a collection's keyword taking its value as is.
+  k = AllTypes.enqueue(repo: repo, i: 1, f: 2.5, s: "s", b: true, t: all.t, by: all.by, sym: :sym, n: nil, xs: [1, 2],
+                       h: {"k" => 3}, set: Set["a", "b"], inner: Inner.new(["x"], true))
+  Divider::Testing.drain(repo, jobs: [AllTypes])
+  check(run_of(repo, t.id) == all.inspect, "every type: #{run_of(repo, t.id)} vs #{all.inspect}")
+  check(run_of(repo, k.id) == all.inspect, "every type, keywords: #{run_of(repo, k.id)} vs #{all.inspect}")
+  # Arguments that no longer fit the class (a deploy changed it):
+  # discarded, not retried, the error naming where.
+  repo.exec("INSERT INTO divider_jobs (class, queue, args) VALUES ('Welcome', 'mail', '{\"user_id\": \"x\"}')")
+  bad = repo.query("SELECT max(id) FROM divider_jobs") { |r| r.int(0) }[0]
+  Divider::Testing.drain(repo, jobs: [Welcome])
+  row = repo.query("SELECT state, attempt, errors->0->>'error', errors->0->>'message' FROM divider_jobs WHERE id = $1", [bad]) do |r|
+    [r.string(0), r.int(1).to_s, r.string(2), r.string(3)]
+  end[0]
+  check(row[0] == "discarded" && row[1] == "1" && row[2] == "Divider::ArgsError", "mismatch discarded: #{row.inspect}")
+  check(row[3].include?("WelcomeArgs") && row[3].include?("user_id"), "the message names the type and the field: #{row[3]}")
+end
+
+def run_of(repo: Rotor::Repo, id: Int) -> String
+  found = repo.query("SELECT args FROM welcome_runs WHERE job_id = $1", [id]) { |r| r.string(0) }
+  found.first? || "(not run)"
 end
 
 begin
   PG::Testing.with_cluster do |url|
     PG::Pool.open(url, 1) do |pool|
       repo = Rotor::Repo.new(pool: pool)
-      repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_args_versions")
+      repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_args_versions, welcome_runs")
       begin
         Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_args_versions").migrate
         run(repo)
       ensure
-        repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_args_versions")
+        repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_args_versions, welcome_runs")
       end
     end
   end

@@ -1,7 +1,6 @@
-# Jobs with arguments (test/args_test.qz runs the program): `args`, the
-# keyword `enqueue`, `enqueue_args` and `unique by:`. A fixture so that
-# the cog's own tests compile while quarz-lang/quarz#397 refuses `args`
-# statements. It is checked against this checkout of divider.
+# Jobs with arguments (test/args_test.qz runs the program): `job_args`,
+# the keyword `enqueue`, `enqueue_args`, `unique by:`, and the worker
+# decoding the arguments. It is checked against this checkout of divider.
 [cog]
 name = "args_jobs"
 version = "0.1.0"

@@ -21,47 +21,66 @@ class BadTimeout < Divider::Job
 end
 
 class NoFields < Divider::Job
-  args Empty
+  job_args Empty
 end
 
 class ReservedName < Divider::Job
-  args Named
+  job_args Named
 end
 
 class NotEncodable < Divider::Job
-  args Holding
+  job_args Holding
 end
 
 class NestedNotEncodable < Divider::Job
-  args Deep
+  job_args Deep
 end
 
-class Twice < Divider::Job
-  args Good
-  args Good
+class Twice < GoodBase
+  job_args Good
+  job_args Good
 end
 
-class UniqueUnknown < Divider::Job
-  args Good
+class UniqueUnknown < GoodBase
+  job_args Good
   unique by: [:user]
 end
 
-class UniqueDefaulted < Divider::Job
-  args Good
+class UniqueDefaulted < GoodBase
+  job_args Good
   unique by: [:template]
 end
 
-class UniqueFirst < Divider::Job
+class UniqueFirst < GoodBase
   unique by: [:user_id]
-  args Good
+  job_args Good
 end
 
-class Fine < Divider::Job
-  args Good
+class Fine < GoodBase
+  job_args Good
 end
 
 def calls(repo: Rotor::Repo) -> Void
   Fine.enqueue(repo: repo, user_id: "1")
   Fine.enqueue(repo: repo, user_id: 1, colour: "red")
   Fine.enqueue_args(repo: repo, args: 3)
+end
+
+# (The `perform(args, job)` of the classes above that declare `Good`.)
+class GoodBase < Divider::Job
+  def perform(args: Good, job: Divider::Context) -> Void
+  end
+end
+
+data Other = (x: Int)
+
+class NoPerform < Divider::Job
+  job_args Good
+end
+
+class Redeclared < Fine
+  job_args Other
+
+  def perform(args: Other, job: Divider::Context) -> Void
+  end
 end
