@@ -59,14 +59,14 @@ class Job
     q = name.to_s
     raise ArgumentError.new("a queue's name is letters, digits and _, not #{q.inspect}") unless q.match?(/\A[A-Za-z0-9_]{1,64}\z/)
     doc "The queue: `#{q}`."
-    def_class_method(:job_queue) { q }
+    def_class_method(:job_queue, override: true) { q }
   end
 
   # How many attempts the job gets before it is discarded: 1 or more.
   static def self.max_attempts(n: Int) -> Void
     raise ArgumentError.new("max_attempts is 1 or more, not #{n}") if n < 1
     doc "How many attempts before the job is discarded: #{n}."
-    def_class_method(:job_max_attempts) { n }
+    def_class_method(:job_max_attempts, override: true) { n }
   end
 
   # The time an attempt may take: longer, the attempt is stopped and
@@ -75,7 +75,7 @@ class Job
     ms = limit.to_ms
     raise ArgumentError.new("a timeout is at least 1ms, not #{limit}") if ms < 1
     doc "The time an attempt may take: #{ms}ms."
-    def_class_method(:job_timeout_ms) do -> Int?
+    def_class_method(:job_timeout_ms, override: true) do -> Int?
       ms
     end
   end
@@ -141,12 +141,12 @@ class Job
       Job.insert(self, given, JSON.generate(given[:args]))
     end
     doc "The class of the job's arguments: `#{type.name}`."
-    def_class_method(:job_args_type) do -> Type[Object]?
+    def_class_method(:job_args_type, override: true) do -> Type[Object]?
       args_type
     end
     type_name = type.name
     doc ":nodoc:"
-    def_method(:run_with, [:job, :args]) do |job: Context, text: String| -> Void
+    def_method(:run_with, [:job, :args], override: true) do |job: Context, text: String| -> Void
       decoded = begin
         JSON.decode[A](text)
       rescue JSON::DecodeError => e
@@ -222,7 +222,7 @@ class Job
     end
     u = Unique.new(by.map(&:to_s).sort, ms)
     doc "The job's uniqueness."
-    def_class_method(:job_unique) do -> Unique?
+    def_class_method(:job_unique, override: true) do -> Unique?
       u
     end
   end
