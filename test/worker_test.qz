@@ -66,11 +66,35 @@ end
 class WtNoPerform < Divider::Job
 end
 
+# Runs for a while (several nodes share them).
+class WtShared < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    Task.sleep(20.ms)
+    job.repo.exec("INSERT INTO wt_runs (job_id, attempt) VALUES ($1, $2)", [job.id, job.attempt])
+  end
+end
+
+# Lets a cancellation of its own escape: an await of a cancelled task.
+class WtAwait < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    t = Task.spawn { Task.sleep(10.seconds) }
+    t.cancel
+    t.await
+  end
+end
+
+# Runs for two seconds.
+class WtTwo < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    Task.sleep(2.seconds)
+  end
+end
+
 # The worker against a server (`PG::Testing`): running jobs once each
 # with two workers, the notification, failures and retries, Discard,
 # Snooze, timeouts, cancellation, shutdown, rescue and pruning.
 class WorkerTest < Test::Case
-  ALL = [WtCount, WtFail, WtDiscard, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform]
+  ALL = [WtCount, WtFail, WtDiscard, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo]
 
   def with_repo(&: (Rotor::Repo, String) -> Void) -> Void
     PG::Testing.with_cluster do |url|
@@ -95,12 +119,22 @@ class WorkerTest < Test::Case
   end
 
   def worker(url: String, *, queues: Hash[Symbol, Int] = {default: 3}, poll: Duration = 100.ms, node: String = "test-node",
-             events: Channel[Divider::Event]? = nil) -> Divider::Worker
+             events: Channel[Divider::Event]? = nil, heartbeat: Duration = 30.seconds, stale_after: Duration = 5.minutes) -> Divider::Worker
     if (ch = events)
-      Divider::Worker.new(url, jobs: ALL, queues: queues, poll: poll, node: node, on_error: ->(e: Exception, c: Divider::Context) { nil },
+      Divider::Worker.new(url, jobs: ALL, queues: queues, poll: poll, node: node, heartbeat: heartbeat, stale_after: stale_after,
+                          on_error: ->(e: Exception, c: Divider::Context) { nil },
                           on_event: ->(ev: Divider::Event) { ch.try_send(ev); nil })
     else
-      Divider::Worker.new(url, jobs: ALL, queues: queues, poll: poll, node: node, on_error: ->(e: Exception, c: Divider::Context) { nil })
+      Divider::Worker.new(url, jobs: ALL, queues: queues, poll: poll, node: node, heartbeat: heartbeat, stale_after: stale_after,
+                          on_error: ->(e: Exception, c: Divider::Context) { nil })
+    end
+  end
+
+  # Waits (at most 10 seconds) until the job `id` is in `want`.
+  def wait_state(repo: Rotor::Repo, id: Int, want: String) -> Void
+    200.times do
+      break if state(repo, id) == want
+      Task.sleep(50.ms)
     end
   end
 
@@ -125,7 +159,7 @@ class WorkerTest < Test::Case
 
   def test_runs_each_job_once_with_two_workers
     with_repo do |repo, url|
-      ids = (1..60).map { |_| WtCount.enqueue(repo).id }
+      ids = (1..60).map { |_| WtShared.enqueue(repo).id }
       a = worker(url, node: "a")
       b = worker(url, node: "b")
       ta = Task.spawn { a.run }
@@ -272,6 +306,85 @@ class WorkerTest < Test::Case
       # Back to available, the attempt not counted.
       assert_equal([["available", 0]], repo.query("SELECT state, attempt FROM divider_jobs") { |r| [r.string(0), r.int(1)] })
       assert_equal(1, count(repo, "SELECT count(*) FROM divider_jobs WHERE node IS NULL AND locked_at IS NULL"))
+    end
+  end
+
+  def test_a_job_s_own_cancellation_fails_it_and_the_worker_goes_on
+    with_repo do |repo, url|
+      a = WtAwait.enqueue(repo)
+      ids = (1..5).map { |_| WtCount.enqueue(repo).id }
+      run_until(worker(url)) { state(repo, a.id) == "failed" && count(repo, "SELECT count(*) FROM wt_runs") == 5 }
+      assert_equal("failed", state(repo, a.id))
+      assert_equal(["Task::Cancelled 1"], repo.query("SELECT errors->0->>'error', attempt FROM divider_jobs WHERE id = $1", [a.id]) { |r| "#{r.string(0)} #{r.int(1)}" })
+      assert_equal(5, count(repo, "SELECT count(*) FROM wt_runs"))
+    end
+  end
+
+  def test_the_heartbeat_goes_on_during_the_grace
+    with_repo do |repo, url|
+      job = WtTwo.enqueue(repo)
+      a = worker(url, node: "a", heartbeat: 200.ms, stale_after: 1.second)
+      b = worker(url, node: "b", heartbeat: 200.ms, stale_after: 1.second)
+      t = Task.spawn { a.run }
+      wait_state(repo, job.id, "running")
+      a.shutdown
+      # (Longer than stale_after, within the job's two seconds: a's beats
+      # keep b from rescuing it.)
+      Task.sleep(1500.ms)
+      b.maintain_once(repo)
+      assert_equal([["running", "a"]], repo.query("SELECT state, node FROM divider_jobs") { |r| [r.string(0), r.string(1)] })
+      t.await
+      assert_equal("completed", state(repo, job.id))
+      b.shutdown
+      b.run
+    end
+  end
+
+  def test_a_requested_cancellation_holds_through_a_shutdown
+    with_repo do |repo, url|
+      job = WtBlock.enqueue(repo)
+      w = worker(url)
+      t = Task.spawn { w.run }
+      wait_state(repo, job.id, "running")
+      assert_equal(:requested, Divider.cancel(repo, job.id))
+      w.shutdown(100.ms)
+      t.await
+      assert_equal("cancelled", state(repo, job.id))
+    end
+  end
+
+  def test_a_second_shutdown_cancels_at_once
+    with_repo do |repo, url|
+      job = WtBlock.enqueue(repo)
+      w = worker(url)
+      t = Task.spawn { w.run }
+      wait_state(repo, job.id, "running")
+      w.shutdown
+      Task.sleep(300.ms)
+      assert_equal("running", state(repo, job.id))
+      w.shutdown
+      t.await
+      assert_equal([["available", 0]], repo.query("SELECT state, attempt FROM divider_jobs") { |r| [r.string(0), r.int(1)] })
+    end
+  end
+
+  def test_the_listener_reconnects
+    with_repo do |repo, url|
+      # (Polling every 30 seconds: only a notification wakes it.)
+      w = worker(url, poll: 30.seconds)
+      t = Task.spawn { w.run }
+      begin
+        Task.sleep(500.ms)
+        killed = repo.query("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE query LIKE 'LISTEN %'") { |r| r.int(0) }[0]
+        assert_equal(1, killed)
+        Task.sleep(1500.ms)
+        job = WtCount.enqueue(repo)
+        wait_state(repo, job.id, "completed")
+        assert_equal("completed", state(repo, job.id))
+      ensure
+        w.shutdown
+        t.await
+      end
     end
   end
 

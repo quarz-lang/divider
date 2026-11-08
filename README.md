@@ -79,8 +79,15 @@ worker.run                       # or Task.spawn { worker.run } beside an HTTP s
   plus up to 30, until `max_attempts`, then discarded. Each failure is
   recorded in the row's `errors`.
 - `shutdown(grace)` stops fetching and gives the running jobs `grace`
-  to finish; those still running are cancelled and go back to
-  `available`, the attempt not counted.
+  to finish (the heartbeat goes on meanwhile); those still running are
+  cancelled and go back to `available`, the attempt not counted, or to
+  `cancelled` when `Divider.cancel` asked for it. A second `shutdown`
+  (a second Ctrl-C to `Divider.serve`) cancels them at once.
+- A lost listening connection is opened again (the dispatchers poll
+  meanwhile). A job whose outcome cannot be written (the database gone)
+  stays `running` until a node rescues it.
+- Each worker's `node` must be unique among the running workers (the
+  default adds a random suffix to `HOSTNAME` and the pid).
 - Every 30 seconds a node marks its running jobs alive; one node at a
   time (an advisory lock) gives back the running jobs of a node silent
   for 5 minutes and deletes completed jobs after 7 days, discarded and
