@@ -83,10 +83,22 @@ class WtAwait < Divider::Job
   end
 end
 
-# Runs for two seconds.
+# Runs for three seconds.
 class WtTwo < Divider::Job
   def perform(job: Divider::Context) -> Void
-    Task.sleep(2.seconds)
+    Task.sleep(3.seconds)
+  end
+end
+
+class WtArgsError < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    raise Divider::ArgsError.new("the arguments do not fit")
+  end
+end
+
+class WtQuick < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    Task.sleep(5.ms)
   end
 end
 
@@ -94,7 +106,7 @@ end
 # with two workers, the notification, failures and retries, Discard,
 # Snooze, timeouts, cancellation, shutdown, rescue and pruning.
 class WorkerTest < Test::Case
-  ALL = [WtCount, WtFail, WtDiscard, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo]
+  ALL = [WtCount, WtFail, WtDiscard, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo, WtArgsError, WtQuick]
 
   def with_repo(&: (Rotor::Repo, String) -> Void) -> Void
     PG::Testing.with_cluster do |url|
@@ -328,10 +340,14 @@ class WorkerTest < Test::Case
       t = Task.spawn { a.run }
       wait_state(repo, job.id, "running")
       a.shutdown
-      # (Longer than stale_after, within the job's two seconds: a's beats
-      # keep b from rescuing it.)
-      Task.sleep(1500.ms)
-      b.maintain_once(repo)
+      # (Longer than stale_after, within the job's three seconds: a's
+      # beats keep b from rescuing it; b tries several times, in case a's
+      # maintenance holds the lock at one of them.)
+      Task.sleep(1200.ms)
+      5.times do
+        b.maintain_once(repo)
+        Task.sleep(100.ms)
+      end
       assert_equal([["running", "a"]], repo.query("SELECT state, node FROM divider_jobs") { |r| [r.string(0), r.string(1)] })
       t.await
       assert_equal("completed", state(repo, job.id))
@@ -375,8 +391,11 @@ class WorkerTest < Test::Case
       t = Task.spawn { w.run }
       begin
         Task.sleep(500.ms)
-        killed = repo.query("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE query LIKE 'LISTEN %'") { |r| r.int(0) }[0]
-        assert_equal(1, killed)
+        # (This database's listeners: another test's, on a shared server,
+        # would reconnect as well.)
+        killed = repo.query("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity " +
+                            "WHERE query LIKE 'LISTEN %' AND datname = current_database()") { |r| r.int(0) }[0]
+        assert_true(killed >= 1)
         Task.sleep(1500.ms)
         job = WtCount.enqueue(repo)
         wait_state(repo, job.id, "completed")
@@ -385,6 +404,42 @@ class WorkerTest < Test::Case
         w.shutdown
         t.await
       end
+    end
+  end
+
+  def test_args_error_discards_without_retry
+    with_repo do |repo, url|
+      job = WtArgsError.enqueue(repo)
+      run_until(worker(url)) { state(repo, job.id) == "discarded" }
+      assert_equal([["discarded", 1]], repo.query("SELECT state, attempt FROM divider_jobs") { |r| [r.string(0), r.int(1)] })
+    end
+  end
+
+  def test_a_zero_grace_leaves_nothing_running
+    with_repo do |repo, url|
+      200.times { WtQuick.enqueue(repo) }
+      w = worker(url, queues: {default: 3})
+      t = Task.spawn { w.run }
+      100.times do
+        break if count(repo, "SELECT count(*) FROM divider_jobs WHERE state = 'completed'") >= 20
+        Task.sleep(10.ms)
+      end
+      w.shutdown(0.seconds)
+      t.await
+      assert_equal(0, count(repo, "SELECT count(*) FROM divider_jobs WHERE state = 'running'"))
+      # (Those cut short or never started: back, the attempt not counted.)
+      assert_equal(0, count(repo, "SELECT count(*) FROM divider_jobs WHERE state = 'available' AND attempt > 0"))
+      assert_equal(200, count(repo, "SELECT count(*) FROM divider_jobs WHERE state IN ('completed', 'available')"))
+    end
+  end
+
+  def test_a_cancellation_asked_while_a_failure_is_handled
+    with_repo do |repo, url|
+      job = WtFail.enqueue(repo)
+      w = Divider::Worker.new(url, jobs: ALL, poll: 100.ms, node: "test-node",
+                              on_error: ->(e: Exception, c: Divider::Context) { Divider.cancel(c.repo, c.id); nil })
+      run_until(w) { state(repo, job.id) == "cancelled" }
+      assert_equal("cancelled", state(repo, job.id))
     end
   end
 
@@ -417,8 +472,10 @@ class WorkerTest < Test::Case
 
   def test_maintenance_beats_rescues_and_prunes
     with_repo do |repo, url|
-      # A job of a node that stopped beating, one of a node still beating
-      # (this one), and one whose last attempt it was.
+      # A job of a node that stopped beating, one of this node's name but
+      # not run by this process (a crashed run of the same name: the
+      # heartbeat beats only the jobs this process runs), and one whose
+      # last attempt it was.
       repo.exec("INSERT INTO divider_jobs (class, queue, state, node, attempt, locked_at) VALUES " +
                 "('WtCount', 'default', 'running', 'gone', 1, now() - interval '10 minutes'), " +
                 "('WtCount', 'default', 'running', 'test-node', 1, now() - interval '10 minutes'), " +
@@ -430,7 +487,7 @@ class WorkerTest < Test::Case
       w = worker(url)
       w.maintain_once(repo)
       states = repo.query("SELECT node, state, attempt FROM divider_jobs WHERE attempt > 0 ORDER BY id") { |r| "#{r.string?(0)} #{r.string(1)} #{r.int(2)}" }
-      assert_equal([" available 1", "test-node running 1", " discarded 20"], states)
+      assert_equal([" available 1", " available 1", " discarded 20"], states)
       assert_equal("Divider::Rescued", repo.query("SELECT errors->0->>'error' FROM divider_jobs WHERE attempt = 20") { |r| r.string(0) }[0])
       assert_equal(1, count(repo, "SELECT count(*) FROM divider_jobs WHERE state = 'completed'"))
       assert_equal(1, count(repo, "SELECT count(*) FROM divider_jobs WHERE state = 'discarded' AND attempt = 0"))

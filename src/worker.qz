@@ -52,6 +52,9 @@ class Worker
   # The grace `shutdown` gave (nil: wait for the running jobs).
   @grace: Atom[Duration?]
   @started: Atom[Bool]
+  # The ids of the jobs this process runs now: the heartbeat's (a node
+  # name reused after a crash does not keep the crashed run's alive).
+  @running: Atom[Set[Int]]
 
   # A worker of `jobs` (the classes it may run) over the database `url`,
   # running `queues` (each queue's name, and how many of its jobs run at
@@ -89,6 +92,7 @@ class Worker
     @force = Channel[Nil].new
     @grace = Atom[Duration?].new(nil)
     @started = Atom[Bool].new(false)
+    @running = Atom[Set[Int]].new(Set[Int].new)
   end
 
   # This process's name in the rows it runs.
@@ -157,7 +161,8 @@ class Worker
         c.listen(Queue::CHANNEL)
         wakes.each_value { |ch| ch.try_send(nil) }
         until @stop.closed?
-          if (note = c.wait_for_notify(timeout: @poll))
+          # (Short waits: `shutdown` is seen soon.)
+          if (note = c.wait_for_notify(timeout: @poll < LISTEN_WAIT ? @poll : LISTEN_WAIT))
             wakes[note.payload]?&.try_send(nil)
           end
         end
@@ -190,65 +195,83 @@ class Worker
     n.times { tokens.send(nil) }
     # (A job that ends wakes the dispatcher to fetch again.)
     freed = Channel[Nil].new(1)
+    # (The attempts that began: one spawned and cancelled before it began
+    # never runs, so the dispatcher gives its row back at the end.)
+    begun = Atom[Set[Int]].new(Set[Int].new)
+    unstarted: Array[Fetched] = []
     w = self
-    Task.scope do |js|
-      stopping = false
-      until stopping
-        stopping = @stop.closed?
-        free = tokens.size
-        none: Array[Fetched] = []
-        fetched = stopping || free == 0 ? none : fetch(q, free)
-        spawned = 0
-        begin
-          fetched.each do |row|
-            tokens.receive
-            js.spawn { w.attempt(row, tokens, freed) }
-            spawned += 1
+    begin
+      Task.scope do |js|
+        stopping = false
+        until stopping
+          stopping = @stop.closed?
+          free = tokens.size
+          none: Array[Fetched] = []
+          fetched = stopping || free == 0 ? none : fetch(q, free)
+          spawned = 0
+          begin
+            fetched.each do |row|
+              tokens.receive
+              js.spawn { w.attempt(row, tokens, freed, begun) }
+              unstarted = unstarted + [row]
+              spawned += 1
+            end
+          rescue Task::Cancelled => c
+            # (Fetched, not spawned: given back.)
+            fetched.each_with_index { |row, i| release(row) if i >= spawned }
+            raise c
           end
-        rescue Task::Cancelled => c
-          # (Fetched, not started: given back.)
-          fetched.each_with_index { |row, i| release(row) if i >= spawned }
-          raise c
+          # (Forget the attempts that began.)
+          seen = begun.get
+          unless seen.empty?
+            unstarted = unstarted.reject { |r| seen.include?(r.id) }
+            begun.update { |b| b - seen }
+          end
+          # (All the free slots taken: there may be more.)
+          next if !stopping && free > 0 && fetched.size == free
+          unless stopping
+            begin
+              Channel.select do |sel|
+                sel.receive(wake) { |_| nil }
+                sel.receive(freed) { |_| nil }
+                sel.receive(@stop) { |_| nil }
+                sel.after(@poll) { nil }
+              end
+            rescue Channel::Closed
+              stopping = true
+            end
+          end
         end
-        # (All the free slots taken: there may be more.)
-        next if !stopping && free > 0 && fetched.size == free
-        unless stopping
+        # Stopping: the running jobs have the grace to finish, unless a
+        # second `shutdown` forces them.
+        grace = @grace.get
+        deadline = grace ? Time.now + grace : nil
+        back = 0
+        cut = false
+        until back == n || cut
+          left = deadline ? deadline - Time.now : nil
+          if left && left <= 0.seconds
+            cut = true
+            next
+          end
           begin
             Channel.select do |sel|
-              sel.receive(wake) { |_| nil }
-              sel.receive(freed) { |_| nil }
-              sel.receive(@stop) { |_| nil }
-              sel.after(@poll) { nil }
+              sel.receive(tokens) { |_| back += 1 }
+              sel.receive(@force) { |_| nil }
+              sel.after(left || 1.hour) { nil }
             end
           rescue Channel::Closed
-            stopping = true
+            cut = true
           end
         end
+        js.cancel if cut
+        nil
       end
-      # Stopping: the running jobs have the grace to finish, unless a
-      # second `shutdown` forces them.
-      grace = @grace.get
-      deadline = grace ? Time.now + grace : nil
-      back = 0
-      cut = false
-      until back == n || cut
-        left = deadline ? deadline - Time.now : nil
-        if left && left <= 0.seconds
-          cut = true
-          next
-        end
-        begin
-          Channel.select do |sel|
-            sel.receive(tokens) { |_| back += 1 }
-            sel.receive(@force) { |_| nil }
-            sel.after(left || 1.hour) { nil }
-          end
-        rescue Channel::Closed
-          cut = true
-        end
+    ensure
+      Task.uncancellable do
+        seen = begun.get
+        unstarted.each { |row| release(row) unless seen.include?(row.id) }
       end
-      js.cancel if cut
-      nil
     end
   end
 
@@ -256,7 +279,9 @@ class Worker
   # Runs one attempt of `row`, records how it ended, and gives back its
   # slot. Only the worker's own cancellation leaves it (the row given
   # back first).
-  def attempt(row: Fetched, tokens: Channel[Nil], freed: Channel[Nil]) -> Void
+  def attempt(row: Fetched, tokens: Channel[Nil], freed: Channel[Nil], begun: Atom[Set[Int]]) -> Void
+    begun.update { |b| b.add(row.id) }
+    @running.update { |r| r.add(row.id) }
     begin
       outcome = begin
         run_attempt(row)
@@ -267,6 +292,7 @@ class Worker
       record(row, outcome)
     ensure
       Task.uncancellable do
+        @running.update { |r| r.delete(row.id) }
         tokens.send(nil)
         freed.try_send(nil)
       end
@@ -295,6 +321,8 @@ class Worker
       raise c if Task.current.cancelled?
       failure(row, ctx, c, started)
     rescue Exception => e
+      # (A job that swallowed the worker's cancellation: still that.)
+      Task.check_cancel
       failure(row, ctx, e, started)
     end
   end
@@ -346,15 +374,25 @@ class Worker
           elsif o.error_json
             params = params + [o.error_json]
           end
-          Rotor::Repo.new(pool: @pool).exec(o.sql, params)
-          true
+          # (The state the row took: a cancellation asked meanwhile
+          # makes it `cancelled`; none when another node rescued it.)
+          Rotor::Repo.new(pool: @pool).query(o.sql + " RETURNING state", params) { |r| r.string(0) }.first?
         end
       rescue StandardError => e
         STDERR.puts "divider: recording job #{row.id} as #{o.kind} failed (#{e.class.name}: #{e.message}); it is rescued later"
-        false
+        nil
       end
     end
-    emit(o.kind, row, o.ms, o.message) if written
+    return if written.nil?
+    # (A row deleted at once, `keep_completed` 0, gives its `running`.)
+    kind = case written
+           when "completed", "running" then :completed
+           when "failed" then :failed
+           when "scheduled" then :snoozed
+           when "discarded" then :discarded
+           else :cancelled
+           end
+    emit(kind, row, o.ms, o.message)
   end
 
   # :nodoc:
@@ -401,7 +439,11 @@ class Worker
   # then, on one node at a time (an advisory lock), the rescue of the
   # running jobs of nodes that stopped beating and the pruning.
   def maintain_once(repo: Rotor::Repo) -> Void
-    repo.exec("UPDATE divider_jobs SET locked_at = now() WHERE state = 'running' AND node = $1", [@node])
+    ids = @running.get
+    unless ids.empty?
+      repo.exec("UPDATE divider_jobs SET locked_at = now() WHERE state = 'running' AND node = $1 " +
+                "AND id IN (SELECT jsonb_array_elements_text($2::jsonb)::bigint)", [@node, JSON.generate(ids.to_a)])
+    end
     rescued: Array[Fetched] = []
     repo.transaction do |tx|
       locked = tx.query("SELECT pg_try_advisory_xact_lock($1)", [LOCK_KEY]) { |r| r.bool(0) }[0]
@@ -422,10 +464,16 @@ class Worker
   def fetch(q: String, limit: Int) -> Array[Fetched]
     repo = Rotor::Repo.new(pool: @pool)
     begin
-      repo.query(FETCH, [q, limit, @node, JSON.generate(@jobs.keys)]) do |r|
-        Fetched.new(r.int(0), r.string(1), r.string(2), r.string(3), r.int(4), r.int(5), r.time(6), r.time(7))
+      # (Not interrupted once sent: the rows the server claimed are in
+      # hand, to run or give back.)
+      Task.uncancellable do
+        Task.timeout(RECORD_LIMIT) do
+          repo.query(FETCH, [q, limit, @node, JSON.generate(@jobs.keys)]) do |r|
+            Fetched.new(r.int(0), r.string(1), r.string(2), r.string(3), r.int(4), r.int(5), r.time(6), r.time(7))
+          end
+        end
       end
-    rescue PG::Error => e
+    rescue StandardError => e
       STDERR.puts "divider: fetching from #{q} failed: #{e.class.name}: #{e.message}"
       none: Array[Fetched] = []
       none
@@ -444,7 +492,8 @@ class Worker
     if (h = @on_error)
       begin
         h.call(e, ctx)
-      rescue => he
+      rescue Exception => he
+        Task.check_cancel
         STDERR.puts "divider: on_error raised #{he.class.name}: #{he.message}"
       end
     else
@@ -458,7 +507,8 @@ class Worker
     return if h.nil?
     begin
       h.call(Event.new(kind, row.id, row.class_name, row.queue, row.attempt, ms, error))
-    rescue => e
+    rescue Exception => e
+      Task.check_cancel
       STDERR.puts "divider: on_event raised #{e.class.name}: #{e.message}"
     end
   end
@@ -477,8 +527,11 @@ class Worker
     h.nil? || h.empty? ? "node" : h
   end
 
-  # The longest a row's update after an attempt may take.
+  # The longest a row's update after an attempt, or a fetch, may take.
   RECORD_LIMIT = 30.seconds
+
+  # The longest the listener waits for a notification at once.
+  LISTEN_WAIT = 500.ms
 
   # The key of the advisory lock one node's maintenance holds.
   LOCK_KEY = 4_812_215_640_413_871
@@ -496,13 +549,17 @@ class Worker
   FINISH_DELETE = "DELETE FROM divider_jobs" + GUARD
   FINISH_RELEASED = "UPDATE divider_jobs SET state = CASE WHEN cancelled_at IS NULL THEN 'available' ELSE 'cancelled' END, " +
                     "attempt = CASE WHEN cancelled_at IS NULL THEN attempt - 1 ELSE attempt END, node = NULL, locked_at = NULL" + GUARD
-  FINISH_SNOOZED = "UPDATE divider_jobs SET state = 'scheduled', attempt = attempt - 1, node = NULL, locked_at = NULL, " +
-                   "scheduled_at = now() + $4::bigint * interval '1 millisecond'" + GUARD
-  FINISH_DISCARDED = "UPDATE divider_jobs SET state = 'discarded', discarded_at = now(), locked_at = NULL, " +
+  # (A cancellation asked meanwhile wins over a snooze, a failure or a
+  # discard: the row ends `cancelled`.)
+  FINISH_SNOOZED = "UPDATE divider_jobs SET state = CASE WHEN cancelled_at IS NULL THEN 'scheduled' ELSE 'cancelled' END, " +
+                   "attempt = CASE WHEN cancelled_at IS NULL THEN attempt - 1 ELSE attempt END, node = NULL, locked_at = NULL, " +
+                   "scheduled_at = CASE WHEN cancelled_at IS NULL THEN now() + $4::bigint * interval '1 millisecond' ELSE scheduled_at END" + GUARD
+  FINISH_DISCARDED = "UPDATE divider_jobs SET state = CASE WHEN cancelled_at IS NULL THEN 'discarded' ELSE 'cancelled' END, " +
+                     "discarded_at = CASE WHEN cancelled_at IS NULL THEN now() END, locked_at = NULL, " +
                      "errors = errors || jsonb_build_array($4::jsonb || jsonb_build_object('at', now()))" + GUARD
   FINISH_CANCELLED = "UPDATE divider_jobs SET state = 'cancelled', cancelled_at = COALESCE(cancelled_at, now()), locked_at = NULL, " +
                      "errors = errors || jsonb_build_array($4::jsonb || jsonb_build_object('at', now()))" + GUARD
-  FINISH_FAILED = "UPDATE divider_jobs SET state = 'failed', node = NULL, locked_at = NULL, " +
+  FINISH_FAILED = "UPDATE divider_jobs SET state = CASE WHEN cancelled_at IS NULL THEN 'failed' ELSE 'cancelled' END, node = NULL, locked_at = NULL, " +
                   "scheduled_at = now() + $5::bigint * interval '1 millisecond', " +
                   "errors = errors || jsonb_build_array($4::jsonb || jsonb_build_object('at', now()))" + GUARD
 
