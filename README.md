@@ -13,6 +13,8 @@ oscillation into the pulses that drive the hands.
 Divider = { git = "https://github.com/quarz-lang/divider", branch = "main" }
 ```
 
+The API reference is at <https://divider.api.quarz.dev>.
+
 The design is [divider#1](https://github.com/quarz-lang/divider/issues/1),
 its comments the decisions taken while it was built.
 

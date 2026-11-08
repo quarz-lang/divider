@@ -1,0 +1,71 @@
+# Publish this cog's API reference (`quarz doc --html`, Quarz's
+# docs/13-doc-comments.md) to GitHub Pages, at https://divider.api.quarz.dev/,
+# on every push to main and on a manual run. Like CI, it uses a quarz
+# built from Quarz's main branch, and the dependencies' main branches
+# (fetched as users get them). The repository's Pages source must be
+# "GitHub Actions"; the custom domain is in the repository's Pages
+# settings (a site published by Actions needs no CNAME file).
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only the deploy job may write Pages.
+permissions:
+  contents: read
+
+# One deployment at a time: a deployment in progress finishes, and the
+# newest push waits for it (the ones in between are skipped).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build the site
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out this cog
+        uses: actions/checkout@v7
+      - name: Check out Quarz (main), to build it
+        uses: actions/checkout@v7
+        with:
+          repository: quarz-lang/quarz
+          path: .quarz
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .quarz
+      - name: Build Quarz
+        run: |
+          cargo build --release --bin quarz --manifest-path .quarz/Cargo.toml
+          echo "$GITHUB_WORKSPACE/.quarz/target/release" >> "$GITHUB_PATH"
+      - name: Check the docs' links
+        run: quarz doc --check
+      - name: Generate the site
+        run: quarz doc --html -o site
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
