@@ -133,7 +133,7 @@ class WorkerTest < Test::Case
   end
 
   def self.reset(repo: Rotor::Repo) -> Void
-    repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_wt_versions, wt_runs")
+    repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_wt_versions, wt_runs")
   end
 
   def worker(url: String, *, queues: Hash[Symbol, Int] = {default: 3}, poll: Duration = 100.ms, node: String = "test-node",

@@ -40,7 +40,7 @@ class QueueTest < Test::Case
   end
 
   def self.reset(repo: Rotor::Repo) -> Void
-    repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_test_versions")
+    repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_test_versions")
   end
 
   # The job `id`'s columns, as text.
@@ -79,7 +79,7 @@ class QueueTest < Test::Case
       assert_raise(PG::Error) { repo.exec("INSERT INTO divider_jobs (class, queue, state) VALUES ('X', 'q', 'lost')") }
       assert_raise(PG::Error) { repo.exec("INSERT INTO divider_jobs (class, queue, priority) VALUES ('X', 'q', 10)") }
       m = Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_test_versions")
-      assert_equal([20261108000001], m.rollback(steps: 1))
+      assert_equal([20261108000002, 20261108000001], m.rollback(steps: 2))
       assert_equal(0, repo.query("SELECT count(*) FROM information_schema.tables WHERE table_name = 'divider_jobs'") { |r| r.int(0) }[0])
     end
   end

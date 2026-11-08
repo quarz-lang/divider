@@ -1,7 +1,7 @@
 # What a running job's `perform` is told of its attempt, and its
 # repository: `repo` is a `Rotor::Repo` over the worker's pool, made for
 # this attempt (each statement takes a connection; a transaction holds
-# one).
+# one), or the test's repository under `Divider::Testing`.
 #
 # ```quarz no_run
 # class PurgeSessions < Divider::Job
@@ -18,13 +18,11 @@ class Context
   @max_attempts: Int
   @inserted_at: Time
   @scheduled_at: Time
-  @pool: PG::Pool
   @repo: Rotor::Repo
 
   # :nodoc:
   def initialize(@id: Int, @class_name: String, @queue: String, @attempt: Int, @max_attempts: Int,
-                 @inserted_at: Time, @scheduled_at: Time, @pool: PG::Pool)
-    @repo = Rotor::Repo.new(pool: @pool)
+                 @inserted_at: Time, @scheduled_at: Time, @repo: Rotor::Repo)
   end
 
   # The job's id.

@@ -9,7 +9,7 @@ module Queue
   # object), priority, when it is due (`at`, or `after` from the
   # database's now, or now), attempts and uniqueness.
   data New = (class_name: String, queue: String, args: String, priority: Int, at: Time?, after: Duration?,
-           max_attempts: Int, unique: Unique?)
+           max_attempts: Int, unique: Unique?, job: Type[Job]? = nil)
 
   # Inserts `job`, in `repo`'s transaction when it is bound to one, and
   # notifies the channel `divider` with the queue's name (delivered at
@@ -17,6 +17,17 @@ module Queue
   # is given instead, and nothing is inserted.
   def self.insert(repo: Rotor::Repo, job: New) -> Enqueued
     raise ArgumentError.new("enqueue takes at: or after:, not both") if job.at && job.after
+    # (`Divider::Testing`: recorded instead, or run once inserted.)
+    if (faked = Testing.faked(job))
+      return faked
+    end
+    e = Queue.insert_row(repo, job)
+    Testing.inserted(repo, e, job)
+    e
+  end
+
+  # The insertion itself.
+  def self.insert_row(repo: Rotor::Repo, job: New) -> Enqueued
     p = job.priority
     raise ArgumentError.new("a priority is 0 to 9, not #{p}") if p < 0 || p > 9
     delay = job.after

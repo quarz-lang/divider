@@ -145,7 +145,7 @@ class Job
     repo = given[:repo].as(Rotor::Repo)
     priority = given[:priority]?.as?(Int) || 5
     Queue.insert(repo, Queue::New.new(cls.name, cls.job_queue, json, priority, given[:at]?.as?(Time),
-                                      given[:after]?.as?(Duration), cls.job_max_attempts, cls.job_unique))
+                                      given[:after]?.as?(Duration), cls.job_max_attempts, cls.job_unique, cls))
   end
 
   # :nodoc:
@@ -203,7 +203,7 @@ class Job
     if t = job_args_type
       raise ArgumentError.new("#{name}.enqueue takes its arguments (#{t.name}) as keywords, or a #{t.name} value with enqueue_args")
     end
-    Queue.insert(repo, Queue::New.new(name, job_queue, "{}", priority, at, after, job_max_attempts, job_unique))
+    Queue.insert(repo, Queue::New.new(name, job_queue, "{}", priority, at, after, job_max_attempts, job_unique, self))
   end
 end
 

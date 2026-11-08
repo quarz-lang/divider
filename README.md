@@ -1,105 +1,193 @@
 # divider
 
 A PostgreSQL-backed job queue for [Quarz](https://github.com/quarz-lang/quarz),
-on [rotor](https://github.com/quarz-lang/rotor): jobs are rows of
+on [rotor](https://github.com/quarz-lang/rotor). Jobs are rows of
 `divider_jobs`, inserted in your transactions and run by workers in Quarz
-tasks. Named after the frequency divider of a quartz movement, which
-turns the crystal's oscillation into the pulses that drive the hands.
+tasks: Oban's and Solid Queue's shape (no Redis). Named after the
+frequency divider of a quartz movement, which turns the crystal's
+oscillation into the pulses that drive the hands.
 
-Work in progress: the design is
-[divider#1](https://github.com/quarz-lang/divider/issues/1). So far there are
-the schema (`Divider::Migrations`), job classes and their options, their
-arguments (encoded; their decoding waits for quarz-lang/quarz#400, and
-the `args` statement itself for quarz-lang/quarz#397), `enqueue`,
-`Divider.cancel`, unique jobs and the worker (`Divider::Worker`,
-`Divider.serve`). Cron and the testing helpers come next.
+```toml
+# Cog.toml of an application
+[dependencies]
+Divider = { git = "https://github.com/quarz-lang/divider", branch = "main" }
+```
+
+The design is [divider#1](https://github.com/quarz-lang/divider/issues/1),
+its comments the decisions taken while it was built. **Not yet:** running a
+job that has arguments (`args`) waits for quarz-lang/quarz#409 (decoding
+them into the job's `data` type); such jobs can be enqueued already.
+
+## The schema
+
+`Divider::Migrations.all` are rotor migrations (`divider_jobs`, and
+`divider_cron` for the cron entries): add them to your migrator's list.
 
 ```quarz no_run
-class Cleanup < Divider::Job
-  queue :maintenance
-  unique period: 1.hour
-end
-
-data WelcomeArgs = (user_id: Int, template: String = "welcome")
-
-class SendWelcome < Divider::Job
-  queue :mail
-  args WelcomeArgs
-  unique by: [:user_id]
-end
-
-def nightly(repo: Rotor::Repo) -> Void
-  Cleanup.enqueue(repo, after: 10.minutes)
-  SendWelcome.enqueue(repo: repo, user_id: 42)
-  SendWelcome.enqueue_args(repo: repo, args: WelcomeArgs.new(42, "again"), priority: 1)
+def migrate(repo: Rotor::Repo, app: Array[Type[Rotor::Migration]]) -> Void
+  Rotor::Migrator.new(repo, app + Divider::Migrations.all).migrate
 end
 ```
 
-A job with `args` is enqueued with keywords: `repo:`, its arguments
-(optional where the `data` type has a default), and `at:` or `after:`,
-`priority:`. Those keywords are checked at compile time by their outer
-class only (`Type#fields` shows a nullable field as `Object` and an
-`Array[Int]` as `Array`: quarz-lang/quarz#401), so a value of the wrong
-type there is found when the worker decodes the job (`Divider::ArgsError`,
-discarded). `enqueue_args` takes an `Args` value, checked fully. For the
-same reason `args` checks that a field can be encoded by its outer class
-only: a nullable or union field, or a collection's elements, of a class
-that cannot (`Pen?`, `Array[Pen]`), is found at decoding too. A job
-with `args` also keeps the argument-less `enqueue(repo, at:, after:,
-priority:)` it inherits, which a call naming none of the arguments
-(`SendWelcome.enqueue(repo: repo)`) resolves to: it raises
-`ArgumentError` ("SendWelcome.enqueue takes its arguments (WelcomeArgs)
-as keywords, or a WelcomeArgs value with enqueue_args") when it runs,
-before inserting anything. A call that names an argument is checked at
-compile time.
-
-## Running jobs
+## Jobs
 
 ```quarz no_run
+data WelcomeArgs = (user_id: Int, template: String = "welcome")
+
+class SendWelcome < Divider::Job
+  queue :mail                    # default :default
+  max_attempts 10                # default 20
+  timeout 2.minutes              # an attempt longer than that fails
+  args WelcomeArgs               # the arguments: a data type of the class's own
+  unique by: [:user_id], period: 1.hour
+
+  def perform(args: WelcomeArgs, job: Divider::Context) -> Void
+    # job.repo: a repository over the worker's pool
+  end
+end
+
 class Cleanup < Divider::Job
   def perform(job: Divider::Context) -> Void
     job.repo.exec("DELETE FROM sessions WHERE expires_at < now()")
   end
 end
 
-worker = Divider::Worker.new(ENV["DATABASE_URL"], jobs: [Cleanup], queues: {default: 10, maintenance: 1})
+def signup(repo: Rotor::Repo) -> Void
+  repo.transaction do |tx|
+    # ... insert the user ...
+    SendWelcome.enqueue(repo: tx, user_id: 42)               # exists once tx commits
+    nil
+  end
+  SendWelcome.enqueue(repo: repo, user_id: 42, after: 10.minutes, priority: 1)
+  SendWelcome.enqueue_args(repo: repo, args: WelcomeArgs.new(42, "again"))
+  job = Cleanup.enqueue(repo, at: Time.utc(2026, 12, 1))     # Divider::Enqueued(id, state, scheduled_at)
+  Divider.cancel(repo, job.id)                               # :cancelled, :requested (running) or nil
+end
+```
+
+- `enqueue` inserts the row and notifies the workers (`pg_notify`) in one
+  statement, in the repository's transaction when it is bound to one: the
+  job exists, and a worker hears of it, only once that commits. `at:` is a
+  time, `after:` a delay from the database's now; `priority:` 0 (first) to
+  9, 5 by default.
+- A job with `args` is enqueued with keywords: `repo:`, its arguments
+  (optional where the data type has a default), and the scheduling ones;
+  an argument named `repo`, `at`, `after` or `priority` is refused. Those
+  keywords are checked by their outer class only (`Type#fields` shows a
+  nullable field as `Object` and `Array[Int]` as `Array`: quarz-lang/quarz#401),
+  and `args` checks a field's encodability by its outer class only; a
+  value that does not fit is found when the worker decodes the job
+  (`Divider::ArgsError`, discarded). `enqueue_args` takes an `Args` value,
+  checked fully. The argument-less `enqueue(repo)` a job with `args`
+  inherits raises `ArgumentError`.
+- `unique` keeps one live job (scheduled, available, running, or failed
+  with a retry pending) per class, values of the `by` arguments (fields
+  without a default), and `period` (by the database's clock); `enqueue`
+  gives the live one's `Enqueued` instead of inserting. Under REPEATABLE
+  READ or SERIALIZABLE it may raise a serialization failure: retry the
+  transaction.
+- `perform` returning ends the job `completed`; `Divider::Discard` discards
+  it; `Divider::Snooze.new(10.minutes)` puts it off without counting the
+  attempt; any other exception, or the `timeout`, fails the attempt,
+  recorded in the row's `errors` and retried after `attempt ** 4 + 15`
+  seconds plus up to 30 (as Oban), until `max_attempts`, then discarded.
+- `Divider.cancel` cancels a scheduled, available or failed job; a running
+  one is asked to stop: it sees `job.cancel_requested?` and raises
+  `Divider::Cancelled` (the job ends `cancelled`), or finishes anyway
+  (`completed`, the request kept in `cancelled_at`).
+
+## Running jobs
+
+```quarz no_run
+worker = Divider::Worker.new(ENV["DATABASE_URL"], jobs: [SendWelcome, Cleanup],
+                             queues: {default: 10, mail: 5})
 Signal.trap(:TERM) { worker.shutdown(25.seconds) }
-worker.run                       # or Task.spawn { worker.run } beside an HTTP server
-# Divider.serve(url, jobs: ..., queues: ...) does the same as a process's main.
+worker.run      # or Task.spawn { worker.run } beside an HTTP server
+# Divider.serve(url, jobs: ..., queues: ...): the same as a process's main (TERM/INT).
 ```
 
 - The worker opens its own pool (the queues' concurrency plus 2
   connections) and a connection that listens for `enqueue`'s
-  notifications; it also polls every `poll` (1 second) for scheduled jobs.
-- `perform` returning ends the job `completed`; `Divider::Discard`
-  discards it; `Divider::Snooze.new(10.minutes)` puts it off without
-  counting the attempt; `Divider::Cancelled` (after
-  `job.cancel_requested?`) cancels it; any other exception, or the class's
-  `timeout`, fails the attempt, retried after `attempt ** 4 + 15` seconds
-  plus up to 30, until `max_attempts`, then discarded. Each failure is
-  recorded in the row's `errors`.
-- `shutdown(grace)` stops fetching and gives the running jobs `grace`
-  to finish (the heartbeat goes on meanwhile); those still running are
-  cancelled and go back to `available`, the attempt not counted, or to
-  `cancelled` when `Divider.cancel` asked for it. A second `shutdown`
-  (a second Ctrl-C to `Divider.serve`) cancels them at once.
-- A lost listening connection is opened again (the dispatchers poll
-  meanwhile). A job whose outcome cannot be written (the database gone)
-  stays `running` until a node rescues it.
-- Each worker's `node` must be unique among the running workers (the
-  default adds a random suffix to `HOSTNAME` and the pid).
-- Every 30 seconds a node marks its running jobs alive; one node at a
-  time (an advisory lock) gives back the running jobs of a node silent
-  for 5 minutes and deletes completed jobs after 7 days, discarded and
-  cancelled ones after 30.
+  notifications, opened again if it is lost; it also polls every `poll`
+  (1 second) for scheduled jobs.
+- `shutdown(grace)` stops fetching and gives the running jobs `grace` to
+  finish; those still running are cancelled and go back to `available`,
+  the attempt not counted (or to `cancelled`, when that was asked). A
+  second `shutdown` (a second Ctrl-C to `Divider.serve`) cancels them at
+  once.
+- Every 30 seconds a worker marks its running jobs alive; one worker at a
+  time (an advisory lock) gives back the running jobs of a worker silent
+  for 5 minutes, and deletes completed jobs after 7 days, discarded and
+  cancelled ones after 30 (`keep_completed:`, `keep_discarded:`; 0 deletes
+  completed jobs at once).
 - A worker fetches only the classes in its `jobs` and never touches the
-  others. Every node running a queue should know all of that queue's
-  classes: queues are how work is split between nodes of different kinds.
-  A row whose class no deploy knows any more stays `available` until
-  `Divider.cancel` removes it.
+  others: every worker running a queue should know all of that queue's
+  classes, and queues are how work is split between workers of different
+  kinds. A row whose class no deploy knows any more stays `available`
+  until `Divider.cancel` removes it.
 - `on_error:` and `on_event:` (`Divider::Event`: started, completed,
   failed, discarded, snoozed, cancelled, rescued, with durations) receive
   what happens; without `on_error`, errors are printed to standard error.
+- Each worker's `node` must differ from the others' running at the same
+  time (the default adds a random suffix to `HOSTNAME` and the pid).
+
+## Recurring jobs
+
+```quarz no_run
+cron = Divider::Cron.new([Divider::Cron.entry("*/5 * * * *", Cleanup),
+                          Divider::Cron.entry("0 3 * * *", SendWelcome, user_id: 1, template: "digest")])
+Divider::Worker.new(url, jobs: [Cleanup, SendWelcome], cron: cron).run
+```
+
+Five-field expressions in UTC (`@hourly`, `@daily` and the like too). A
+worker checks every 15 seconds, by the database's clock, and each entry
+is enqueued once per due minute however many workers check. **A minute no
+worker checked (every worker stopped) is not made up afterwards.** An
+entry's arguments are keywords, encoded when the entry is made and
+checked when the job is decoded.
+
+## Testing
+
+```quarz no_run
+class SignupTest < Test::Case
+  include Divider::Testing::Assertions
+
+  def test_welcome_is_enqueued
+    Divider::Testing.fake do
+      signup(repo)
+      assert_enqueued(SendWelcome, user_id: 42)   # the arguments given, as JSON
+    end
+  end
+
+  def test_cleanup_runs
+    Divider::Testing.inline(repo) { Cleanup.enqueue(repo) }   # run as it is enqueued
+    Divider::Testing.drain(repo, jobs: [Cleanup])             # or: run what is due, once
+  end
+end
+```
+
+- `fake` records enqueues (`Divider::Testing.enqueued`) instead of
+  inserting them.
+- `inline(repo)` runs each job as it is enqueued, in the test's task; one
+  enqueued in a transaction runs at the next enqueue outside one, or when
+  the block ends (a rolled-back one never). Jobs run as a worker runs them:
+  a `Snooze` leaves the job scheduled.
+- `drain(repo, jobs:)` runs the jobs of those classes due now, once.
+- `fake` and `inline` set a mode for the whole process: they are not for
+  tests run in parallel (`quarz test --parallel`).
+
+## In a bezel application
+
+- Add `Divider::Migrations.all` to the migrations `Bezel.main` runs:
+  `migrations: Shop::Migrations.all + Divider::Migrations.all` in
+  `src/main.qz`, so that `bezel migrate` creates the tables.
+- Run the worker beside the endpoint, in the web process
+  (`Task.spawn { worker.run }` before `Bezel.start`, with
+  `config.database_url`), or as a process of its own whose main is
+  `Divider.serve(url, jobs: [...], queues: {...})`.
+- In a controller, enqueue in the request's transaction
+  (`conn.repo.transaction { |tx| ...; SendWelcome.enqueue(repo: tx, ...) }`)
+  so that the job exists only if the request's work was saved.
 
 ## License
 

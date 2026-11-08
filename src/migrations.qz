@@ -12,7 +12,7 @@
 # add migrations, never change these.
 module Migrations
   # The migrations, in order.
-  def self.all -> Array[Type[Rotor::Migration]] = [CreateJobs]
+  def self.all -> Array[Type[Rotor::Migration]] = [CreateJobs, CreateCron]
 end
 
 # The table `divider_jobs` and its indexes: one row a job, from its
@@ -58,5 +58,19 @@ class Migrations::CreateJobs < Rotor::Migration
             "ADD CONSTRAINT divider_jobs_attempts CHECK (max_attempts >= 1 AND attempt >= 0)",
             down: "ALTER TABLE divider_jobs DROP CONSTRAINT divider_jobs_state, " +
                   "DROP CONSTRAINT divider_jobs_priority, DROP CONSTRAINT divider_jobs_attempts"
+  end
+end
+
+# The table `divider_cron`: for each cron entry (by a digest of its
+# expression, class and arguments), the last minute a worker enqueued it
+# for, so that one worker enqueues it once per minute.
+class Migrations::CreateCron < Rotor::Migration
+  version 20261108000002
+
+  def change -> Void
+    create_table :divider_cron, primary_key: false do |t|
+      t.column :key, String, primary: true
+      t.column :last_minute, Time
+    end
   end
 end
