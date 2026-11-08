@@ -1,0 +1,413 @@
+# Runs jobs: for each of its queues, a dispatcher task fetches the jobs
+# that are due (when `enqueue` notifies it, and every `poll` for the
+# scheduled ones and lost notifications) and runs each in a task of its
+# own, up to the queue's concurrency; a maintenance task beats for this
+# node's running jobs, gives back those of nodes that stopped beating, and
+# prunes old rows.
+#
+# ```quarz no_run
+# worker = Divider::Worker.new(ENV["DATABASE_URL"], jobs: [Cleanup, PurgeSessions],
+#                              queues: {default: 10, mail: 5})
+# Signal.trap(:TERM) { worker.shutdown(25.seconds) }
+# worker.run      # until shutdown; or Task.spawn { worker.run } beside an HTTP server
+# ```
+#
+# The worker opens its own pool of connections to `url` (by default the
+# queues' concurrency plus 2) and one connection that listens for
+# `enqueue`'s notifications.
+#
+# A worker fetches only the classes in `jobs`, and leaves the others in
+# the table, never touching them: every node running a queue should know
+# all of that queue's classes. Queues are how work is split between
+# nodes of different kinds (a mail node, a report node). A row whose
+# class no deploy knows any more stays `available` until `Divider.cancel`
+# removes it.
+#
+# An attempt that returns ends the job `completed`. One that raises
+# `Divider::Discard` discards it; `Divider::Snooze` puts it off without
+# counting the attempt; `Divider::Cancelled`, or an exception after
+# `Divider.cancel` asked it to stop, cancels it; any other exception (a
+# `timeout` too) fails the attempt, recorded in the job's `errors`, and
+# the job runs again after `attempt ** 4 + 15` seconds plus a random 0 to
+# 30 (as Oban), until its `max_attempts`, after which it is discarded.
+class Worker
+  include Shareable
+
+  @url: String
+  @pool: PG::Pool
+  @jobs: Hash[String, Type[Job]]
+  @queues: Hash[String, Int]
+  @poll: Duration
+  @node: String
+  @heartbeat: Duration
+  @stale_after: Duration
+  @keep_completed: Duration
+  @keep_discarded: Duration
+  @on_error: (shareable (Exception, Context) -> Void)?
+  @on_event: (shareable (Event) -> Void)?
+  # Closed by `shutdown`: the dispatchers stop fetching.
+  @stop: Channel[Nil]
+  # The grace `shutdown` gave (nil: wait for the running jobs).
+  @grace: Atom[Duration?]
+  @started: Atom[Bool]
+
+  # A worker of `jobs` (the classes it may run) over the database `url`,
+  # running `queues` (each queue's name, and how many of its jobs run at
+  # once). `node` names this process in the rows it runs (by default
+  # `host-pid`).
+  def initialize(@url: String, *, jobs: Array[Type[Job]], queues: Hash[Symbol, Int] = {default: 10},
+                 pool_size: Int? = nil, @poll: Duration = 1.second, node: String? = nil,
+                 @heartbeat: Duration = 30.seconds, @stale_after: Duration = 5.minutes,
+                 @keep_completed: Duration = 7.days, @keep_discarded: Duration = 30.days,
+                 @on_error: (shareable (Exception, Context) -> Void)? = nil,
+                 @on_event: (shareable (Event) -> Void)? = nil)
+    raise ArgumentError.new("a worker runs at least one queue") if queues.empty?
+    raise ArgumentError.new("a worker runs at least one job class") if jobs.empty?
+    by_name: Hash[String, Type[Job]] = {}
+    jobs.each do |j|
+      raise ArgumentError.new("#{j.name} is given twice in jobs") if by_name.key?(j.name)
+      by_name = by_name.put(j.name, j)
+    end
+    @jobs = by_name
+    qs: Hash[String, Int] = {}
+    queues.each_pair do |q, n|
+      raise ArgumentError.new("a queue's name is letters, digits and _, not #{q.to_s.inspect}") unless q.to_s.match?(/\A[A-Za-z0-9_]{1,64}\z/)
+      raise ArgumentError.new("the queue #{q} runs at least 1 job at once, not #{n}") if n < 1
+      qs = qs.put(q.to_s, n)
+    end
+    @queues = qs
+    raise ArgumentError.new("poll is at least 10ms, not #{@poll}") if @poll < 10.ms
+    raise ArgumentError.new("stale_after (#{@stale_after}) must exceed heartbeat (#{@heartbeat})") if @stale_after <= @heartbeat
+    size = pool_size || qs.values.sum + 2
+    raise ArgumentError.new("pool_size is at least 2, not #{size}") if size < 2
+    @pool = PG::Pool.new(@url, size)
+    @node = node || "#{Worker.hostname}-#{Process.pid}"
+    @stop = Channel[Nil].new
+    @grace = Atom[Duration?].new(nil)
+    @started = Atom[Bool].new(false)
+  end
+
+  # This process's name in the rows it runs.
+  def node -> String = @node
+
+  # Runs the queues until `shutdown`, then closes the worker's
+  # connections. A worker runs once.
+  def run -> Void
+    first = true
+    @started.update do |was|
+      first = !was
+      true
+    end
+    raise ArgumentError.new("this worker has run already") unless first
+    listener = PG.connect(@url)
+    begin
+      listener.listen(Queue::CHANNEL)
+      wakes: Hash[String, Channel[Nil]] = {}
+      @queues.each_key { |q| wakes = wakes.put(q, Channel[Nil].new(1)) }
+      w = self
+      Task.scope do |s|
+        @queues.each_pair do |q, n|
+          wake = wakes[q]
+          s.spawn { w.dispatch(q, n, wake) }
+        end
+        s.spawn { w.maintain }
+        until @stop.closed?
+          if (note = listener.wait_for_notify(timeout: @poll))
+            wakes[note.payload]?&.try_send(nil)
+          end
+        end
+        nil
+      end
+    ensure
+      Task.uncancellable do
+        listener.close
+        @pool.close
+      end
+    end
+  end
+
+  # Stops fetching, lets the running jobs finish for `grace` (nil: as long
+  # as they take), then cancels them: their rows go back to `available`,
+  # the attempt not counted. `run` returns then.
+  def shutdown(grace: Duration? = nil) -> Void
+    @grace.set(grace)
+    @stop.close
+  end
+
+  # :nodoc:
+  # The dispatcher of the queue `q`, running up to `n` jobs at once.
+  def dispatch(q: String, n: Int, wake: Channel[Nil]) -> Void
+    tokens = Channel[Nil].new(n)
+    n.times { tokens.send(nil) }
+    # (A job that ends wakes the dispatcher to fetch again.)
+    freed = Channel[Nil].new(1)
+    w = self
+    Task.scope do |js|
+      stopping = false
+      until stopping
+        stopping = @stop.closed?
+        free = tokens.size
+        none: Array[Fetched] = []
+        fetched = stopping || free == 0 ? none : fetch(q, free)
+        fetched.each do |row|
+          tokens.receive
+          js.spawn { w.attempt(row, tokens, freed) }
+        end
+        # (All the free slots taken: there may be more.)
+        next if !stopping && free > 0 && fetched.size == free
+        unless stopping
+          begin
+            Channel.select do |sel|
+              sel.receive(wake) { |_| nil }
+              sel.receive(freed) { |_| nil }
+              sel.receive(@stop) { |_| nil }
+              sel.after(@poll) { nil }
+            end
+          rescue Channel::Closed
+            stopping = true
+          end
+        end
+      end
+      # Stopping: the running jobs have the grace to finish.
+      grace = @grace.get
+      begin
+        if grace
+          Task.timeout(grace) { n.times { tokens.receive } }
+        else
+          n.times { tokens.receive }
+        end
+      rescue Task::Timeout
+        js.cancel
+      end
+      nil
+    end
+  end
+
+  # :nodoc:
+  # Runs one attempt of `row`, records how it ended, and gives back its
+  # slot.
+  def attempt(row: Fetched, tokens: Channel[Nil], freed: Channel[Nil]) -> Void
+    begin
+      cls = @jobs[row.class_name]
+      ctx = Context.new(row.id, row.class_name, row.queue, row.attempt, row.max_attempts, row.inserted_at, row.scheduled_at, @pool)
+      started = Time.now
+      emit(:started, row, nil, nil)
+      begin
+        limit = cls.job_timeout_ms
+        if limit
+          Task.timeout(limit.ms) { cls.run_job(ctx, row.args) }
+        else
+          cls.run_job(ctx, row.args)
+        end
+        ms = Worker.ms_since(started)
+        finish(row, @keep_completed.to_ms == 0 ? FINISH_DELETE : FINISH_COMPLETED, [])
+        emit(:completed, row, ms, nil)
+      rescue Task::Cancelled => c
+        # (The worker's shutdown: the attempt is not counted.)
+        Task.uncancellable { finish(row, FINISH_RELEASED, []) }
+        raise c
+      rescue Discard => e
+        finish(row, FINISH_DISCARDED, [error_json(row, e)])
+        emit(:discarded, row, Worker.ms_since(started), e.message)
+      rescue Snooze => e
+        finish(row, FINISH_SNOOZED, [e.delay.to_ms])
+        emit(:snoozed, row, Worker.ms_since(started), e.message)
+      rescue Cancelled => e
+        finish(row, FINISH_CANCELLED, [error_json(row, e)])
+        emit(:cancelled, row, Worker.ms_since(started), e.message)
+      rescue => e
+        ms = Worker.ms_since(started)
+        report(e, ctx)
+        if ctx.cancel_requested?
+          finish(row, FINISH_CANCELLED, [error_json(row, e)])
+          emit(:cancelled, row, ms, e.message)
+        elsif row.attempt >= row.max_attempts
+          finish(row, FINISH_DISCARDED, [error_json(row, e)])
+          emit(:discarded, row, ms, e.message)
+        else
+          finish(row, FINISH_FAILED, [error_json(row, e), Worker.backoff(row.attempt)])
+          emit(:failed, row, ms, e.message)
+        end
+      end
+    ensure
+      tokens.send(nil)
+      freed.try_send(nil)
+    end
+  end
+
+  # :nodoc:
+  # The maintenance: every `heartbeat` until `shutdown`.
+  def maintain -> Void
+    repo = Rotor::Repo.new(pool: @pool)
+    loop do
+      begin
+        Channel.select do |sel|
+          sel.receive(@stop) { |_| nil }
+          sel.after(@heartbeat) { nil }
+        end
+      rescue Channel::Closed
+        return
+      end
+      begin
+        maintain_once(repo)
+      rescue PG::Error => e
+        STDERR.puts "divider: maintenance failed: #{e.class.name}: #{e.message}"
+      end
+    end
+  end
+
+  # :nodoc:
+  # One round of maintenance: the heartbeat of this node's running jobs,
+  # then, on one node at a time (an advisory lock), the rescue of the
+  # running jobs of nodes that stopped beating and the pruning.
+  def maintain_once(repo: Rotor::Repo) -> Void
+    repo.exec("UPDATE divider_jobs SET locked_at = now() WHERE state = 'running' AND node = $1", [@node])
+    repo.transaction do |tx|
+      locked = tx.query("SELECT pg_try_advisory_xact_lock($1)", [LOCK_KEY]) { |r| r.bool(0) }[0]
+      if locked
+        rescued = tx.query(RESCUE, [@stale_after.to_ms]) do |r|
+          Fetched.new(r.int(0), r.string(1), r.string(2), "{}", r.int(3), r.int(4), r.time(5), r.time(6))
+        end
+        rescued.each { |row| emit(:rescued, row, nil, nil) }
+        tx.exec(PRUNE, [@keep_completed.to_ms, @keep_discarded.to_ms])
+      end
+      nil
+    end
+  end
+
+  # :nodoc:
+  # Up to `limit` due jobs of the queue `q` whose class this worker knows,
+  # now `running` on this node.
+  def fetch(q: String, limit: Int) -> Array[Fetched]
+    repo = Rotor::Repo.new(pool: @pool)
+    begin
+      repo.query(FETCH, [q, limit, @node, JSON.generate(@jobs.keys)]) do |r|
+        Fetched.new(r.int(0), r.string(1), r.string(2), r.string(3), r.int(4), r.int(5), r.time(6), r.time(7))
+      end
+    rescue PG::Error => e
+      STDERR.puts "divider: fetching from #{q} failed: #{e.class.name}: #{e.message}"
+      none: Array[Fetched] = []
+      none
+    end
+  end
+
+  # :nodoc:
+  # Records how the attempt of `row` ended, unless the row is no longer
+  # this attempt's (rescued by another node meanwhile).
+  def finish(row: Fetched, sql: String, extra: Array[Object?]) -> Void
+    Rotor::Repo.new(pool: @pool).exec(sql, [row.id, @node, row.attempt] + extra)
+  end
+
+  # :nodoc:
+  def error_json(row: Fetched, e: Exception) -> String
+    JSON.generate({"attempt" => row.attempt, "error" => e.class.name, "message" => e.message,
+                   "backtrace" => e.backtrace.first(10)})
+  end
+
+  # :nodoc:
+  # `on_error`, or the error on standard error.
+  def report(e: Exception, ctx: Context) -> Void
+    if (h = @on_error)
+      begin
+        h.call(e, ctx)
+      rescue => he
+        STDERR.puts "divider: on_error raised #{he.class.name}: #{he.message}"
+      end
+    else
+      STDERR.puts "divider: #{ctx.class_name} (job #{ctx.id}, attempt #{ctx.attempt}/#{ctx.max_attempts}) raised #{e.class.name}: #{e.message}"
+    end
+  end
+
+  # :nodoc:
+  def emit(kind: Symbol, row: Fetched, ms: Int?, error: String?) -> Void
+    h = @on_event
+    return if h.nil?
+    begin
+      h.call(Event.new(kind, row.id, row.class_name, row.queue, row.attempt, ms, error))
+    rescue => e
+      STDERR.puts "divider: on_event raised #{e.class.name}: #{e.message}"
+    end
+  end
+
+  # :nodoc:
+  # The delay before attempt `attempt + 1`, in milliseconds: Oban's
+  # `attempt ** 4 + 15` seconds plus a random 0 to 30.
+  def self.backoff(attempt: Int) -> Int = ((attempt > 100 ? 100 : attempt) ** 4 + 15 + Random.rand(31)) * 1000
+
+  # :nodoc:
+  def self.ms_since(t: Time) -> Int = (Time.now - t).to_ms
+
+  # :nodoc:
+  def self.hostname -> String
+    h = ENV["HOSTNAME"]?
+    h.nil? || h.empty? ? "node" : h
+  end
+
+  # The key of the advisory lock one node's maintenance holds.
+  LOCK_KEY = 4_812_215_640_413_871
+
+  FETCH = "UPDATE divider_jobs SET state = 'running', node = $3, locked_at = now(), attempt = attempt + 1 " +
+          "WHERE id IN (SELECT id FROM divider_jobs WHERE queue = $1 " +
+          "AND state IN ('available', 'scheduled', 'failed') AND scheduled_at <= now() " +
+          "AND class IN (SELECT jsonb_array_elements_text($4::jsonb)) " +
+          "ORDER BY priority, scheduled_at, id LIMIT $2 FOR UPDATE SKIP LOCKED) " +
+          "RETURNING id, class, queue, args::text, attempt, max_attempts, inserted_at, scheduled_at"
+
+  # (Each of these: $1 the id, $2 the node, $3 the attempt.)
+  GUARD = " WHERE id = $1 AND state = 'running' AND node = $2 AND attempt = $3"
+  FINISH_COMPLETED = "UPDATE divider_jobs SET state = 'completed', completed_at = now(), locked_at = NULL" + GUARD
+  FINISH_DELETE = "DELETE FROM divider_jobs" + GUARD
+  FINISH_RELEASED = "UPDATE divider_jobs SET state = 'available', attempt = attempt - 1, node = NULL, locked_at = NULL" + GUARD
+  FINISH_SNOOZED = "UPDATE divider_jobs SET state = 'scheduled', attempt = attempt - 1, node = NULL, locked_at = NULL, " +
+                   "scheduled_at = now() + $4::bigint * interval '1 millisecond'" + GUARD
+  FINISH_DISCARDED = "UPDATE divider_jobs SET state = 'discarded', discarded_at = now(), locked_at = NULL, " +
+                     "errors = errors || jsonb_build_array($4::jsonb || jsonb_build_object('at', now()))" + GUARD
+  FINISH_CANCELLED = "UPDATE divider_jobs SET state = 'cancelled', cancelled_at = COALESCE(cancelled_at, now()), locked_at = NULL, " +
+                     "errors = errors || jsonb_build_array($4::jsonb || jsonb_build_object('at', now()))" + GUARD
+  FINISH_FAILED = "UPDATE divider_jobs SET state = 'failed', node = NULL, locked_at = NULL, " +
+                  "scheduled_at = now() + $5::bigint * interval '1 millisecond', " +
+                  "errors = errors || jsonb_build_array($4::jsonb || jsonb_build_object('at', now()))" + GUARD
+
+  # Running jobs whose node stopped beating: back to `available` (the
+  # attempt counted), or discarded when that was the last.
+  RESCUE = "UPDATE divider_jobs SET state = CASE WHEN attempt >= max_attempts THEN 'discarded' ELSE 'available' END, " +
+           "discarded_at = CASE WHEN attempt >= max_attempts THEN now() END, node = NULL, locked_at = NULL, " +
+           "errors = errors || jsonb_build_array(jsonb_build_object('at', now(), 'attempt', attempt, 'error', 'Divider::Rescued', " +
+           "'message', 'its node (' || COALESCE(node, '?') || ') stopped beating', 'backtrace', '[]'::jsonb)) " +
+           "WHERE state = 'running' AND locked_at < now() - $1::bigint * interval '1 millisecond' " +
+           "RETURNING id, class, queue, attempt, max_attempts, inserted_at, scheduled_at"
+
+  PRUNE = "DELETE FROM divider_jobs WHERE (state = 'completed' AND completed_at < now() - $1::bigint * interval '1 millisecond') " +
+          "OR (state = 'discarded' AND discarded_at < now() - $2::bigint * interval '1 millisecond') " +
+          "OR (state = 'cancelled' AND cancelled_at < now() - $2::bigint * interval '1 millisecond')"
+end
+
+# :nodoc:
+# A job the worker fetched.
+data Fetched = (id: Int, class_name: String, queue: String, args: String, attempt: Int, max_attempts: Int,
+                inserted_at: Time, scheduled_at: Time)
+
+# What happened to a job, for `on_event`: `kind` is `:started`,
+# `:completed`, `:failed`, `:discarded`, `:snoozed`, `:cancelled` or
+# `:rescued` (given back by maintenance, its node having stopped beating);
+# `duration_ms` the attempt's time (nil for `:started` and `:rescued`),
+# `error` the message of what it raised.
+data Event = (kind: Symbol, id: Int, class_name: String, queue: String, attempt: Int, duration_ms: Int?, error: String?)
+
+# A worker for a process of its own: runs `Worker.new(url, ...)` until
+# SIGTERM or SIGINT, which shut it down with `grace` for the running
+# jobs.
+#
+# ```quarz no_run
+# # src/main.qz of a worker process
+# Divider.serve(ENV["DATABASE_URL"], jobs: [Cleanup, PurgeSessions], queues: {default: 10, mail: 5})
+# ```
+public def serve(url: String, *, jobs: Array[Type[Job]], queues: Hash[Symbol, Int] = {default: 10},
+                 grace: Duration = 25.seconds, node: String? = nil, poll: Duration = 1.second,
+                 on_error: (shareable (Exception, Context) -> Void)? = nil,
+                 on_event: (shareable (Event) -> Void)? = nil) -> Void
+  worker = Worker.new(url, jobs: jobs, queues: queues, node: node, poll: poll, on_error: on_error, on_event: on_event)
+  Signal.trap(:TERM) { worker.shutdown(grace) }
+  Signal.trap(:INT) { worker.shutdown(grace) }
+  worker.run
+end

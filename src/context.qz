@@ -1,0 +1,56 @@
+# What a running job's `perform` is told of its attempt, and its
+# repository: `repo` is a `Rotor::Repo` over the worker's pool, made for
+# this attempt (each statement takes a connection; a transaction holds
+# one).
+#
+# ```quarz no_run
+# class PurgeSessions < Divider::Job
+#   def perform(job: Divider::Context) -> Void
+#     job.repo.exec("DELETE FROM sessions WHERE expires_at < now()")
+#   end
+# end
+# ```
+class Context
+  @id: Int
+  @class_name: String
+  @queue: String
+  @attempt: Int
+  @max_attempts: Int
+  @inserted_at: Time
+  @scheduled_at: Time
+  @pool: PG::Pool
+  @repo: Rotor::Repo
+
+  # :nodoc:
+  def initialize(@id: Int, @class_name: String, @queue: String, @attempt: Int, @max_attempts: Int,
+                 @inserted_at: Time, @scheduled_at: Time, @pool: PG::Pool)
+    @repo = Rotor::Repo.new(pool: @pool)
+  end
+
+  # The job's id.
+  def id -> Int = @id
+  # The job's class's name.
+  def class_name -> String = @class_name
+  # Its queue.
+  def queue -> String = @queue
+  # This attempt's number: 1 for the first.
+  def attempt -> Int = @attempt
+  # The attempts it gets.
+  def max_attempts -> Int = @max_attempts
+  # When it was enqueued.
+  def inserted_at -> Time = @inserted_at
+  # When it was due.
+  def scheduled_at -> Time = @scheduled_at
+  # A repository over the worker's pool.
+  def repo -> Rotor::Repo = @repo
+
+  # Whether `Divider.cancel` asked the job to stop (a query): a long job
+  # polls it, and raises `Divider::Cancelled` to stop, which ends it
+  # `cancelled` (returning instead ends it `completed`).
+  def cancel_requested? -> Bool
+    found = @repo.query("SELECT cancelled_at IS NOT NULL FROM divider_jobs WHERE id = $1", [@id]) { |r| r.bool(0) }
+    found.first? || false
+  end
+
+  def inspect -> String = "#<Divider::Context #{@class_name} id=#{@id} attempt=#{@attempt}/#{@max_attempts}>"
+end
