@@ -6,6 +6,16 @@ class TtNote < Divider::Job
   end
 end
 
+# Enqueues a TtNote in a transaction of its own.
+class TtChain < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    job.repo.transaction do |tx|
+      TtNote.enqueue(tx)
+      nil
+    end
+  end
+end
+
 class TtOnceSnooze < Divider::Job
   unique
 
@@ -176,6 +186,21 @@ class TestingTest < Test::Case
         nil
       end
       assert_equal(2, runs(repo))
+    end
+  end
+
+  def test_inline_runs_what_its_last_jobs_enqueue
+    with_repo do |repo|
+      Divider::Testing.inline(repo) do
+        repo.transaction do |tx|
+          TtChain.enqueue(tx)
+          nil
+        end
+        nil
+      end
+      # (TtChain ran at the block's end, and the TtNote it enqueued too.)
+      assert_equal(1, runs(repo))
+      assert_equal(["completed", "completed"], repo.query("SELECT state FROM divider_jobs ORDER BY id") { |r| r.string(0) })
     end
   end
 

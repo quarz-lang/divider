@@ -180,14 +180,28 @@ module Testing
   # :nodoc:
   # Runs the pending jobs. One not found is kept unless `final`: its
   # transaction (on another connection) may not be over yet.
+  # The final pass goes on until nothing is pending (a job it runs may
+  # enqueue more, in a transaction).
   def self.run_pending(repo: Rotor::Repo, final: Bool) -> Void
-    taken = Testing.take_pending
-    kept: Array[[Int, Type[Job]]] = []
-    taken.each do |entry|
-      ran = Testing.run_one(repo, entry[0], {entry[1].name => entry[1]})
-      kept = kept + [entry] unless ran || final
+    while true
+      taken = Testing.take_pending
+      return if taken.empty?
+      kept: Array[[Int, Type[Job]]] = []
+      i = 0
+      begin
+        while i < taken.size
+          entry = taken[i]
+          ran = Testing.run_one(repo, entry[0], {entry[1].name => entry[1]})
+          kept = kept + [entry] unless ran || final
+          i += 1
+        end
+      ensure
+        # (Kept, and those not reached when a run raised: pending again.)
+        rest = kept + taken[(i < taken.size ? i + 1 : i)...taken.size]
+        STATE.update { |s| s.with(pending: rest + s.pending) } unless rest.empty?
+      end
+      return unless final
     end
-    STATE.update { |s| s.with(pending: kept + s.pending) } unless kept.empty?
   end
 
   # :nodoc:

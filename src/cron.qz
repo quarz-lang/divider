@@ -149,7 +149,7 @@ class Cron
   data Entry = (expression: String, job: Type[Job], args: String, schedule: Schedule)
 
   # The minutes, hours, days, months and days of the week an expression
-  # matches; `any_day`/`any_wday` when those fields were `*`.
+  # matches; `any_day`/`any_wday` when those fields started with `*`.
   data Schedule(minutes: Set[Int], hours: Set[Int], days: Set[Int], months: Set[Int], wdays: Set[Int],
                 any_day: Bool, any_wday: Bool)
     # Whether the minute of `t` (UTC) matches.
