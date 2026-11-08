@@ -136,12 +136,14 @@ worker.run      # or Task.spawn { worker.run } beside an HTTP server
 ```quarz no_run
 cron = Divider::Cron.new([Divider::Cron.entry("*/5 * * * *", Cleanup),
                           Divider::Cron.entry("0 3 * * *", SendWelcome, user_id: 1, template: "digest")])
-Divider::Worker.new(url, jobs: [Cleanup, SendWelcome], cron: cron).run
+Divider::Worker.new(url, jobs: [Cleanup, SendWelcome], queues: {default: 10, mail: 5}, cron: cron).run
 ```
 
 Five-field expressions in UTC (`@hourly`, `@daily` and the like too). A
 worker checks every 15 seconds, by the database's clock, and each entry
-is enqueued once per due minute however many workers check. **A minute no
+is enqueued once per due minute however many workers check (a worker
+enqueues entries whose classes it does not run as well: another worker
+of their queue runs them). **A minute no
 worker checked (every worker stopped) is not made up afterwards.** An
 entry's arguments are keywords, encoded when the entry is made and
 checked when the job is decoded.
@@ -171,7 +173,10 @@ end
 - `inline(repo)` runs each job as it is enqueued, in the test's task; one
   enqueued in a transaction runs at the next enqueue outside one, or when
   the block ends (a rolled-back one never). Jobs run as a worker runs them:
-  a `Snooze` leaves the job scheduled.
+  a `Snooze` leaves the job scheduled. A job enqueued `at:` or `after:` a
+  time runs at once too; a unique enqueue that gives back a live job runs
+  nothing.
+- Under `fake`, `unique` is not applied: each enqueue is recorded.
 - `drain(repo, jobs:)` runs the jobs of those classes due now, once.
 - `fake` and `inline` set a mode for the whole process: they are not for
   tests run in parallel (`quarz test --parallel`).

@@ -35,6 +35,10 @@ class CronTest < Test::Case
     assert_true(due?("30 14 1 * SUN", t))
     assert_true(due?("30 14 8 * MON", t))
     assert_false(due?("30 14 1 * MON", t))
+    # A stepped star counts as unrestricted (Vixie cron): odd days that
+    # are Mondays, not odd days or Mondays.
+    assert_false(due?("0 0 */2 * MON", Time.utc(2026, 11, 16)))
+    assert_true(due?("0 0 */2 * MON", Time.utc(2026, 11, 9)))
     # Macros.
     assert_true(due?("@hourly", Time.utc(2026, 11, 8, 3, 0)))
     assert_true(due?("@daily", Time.utc(2026, 11, 8, 0, 0)))
@@ -50,7 +54,7 @@ class CronTest < Test::Case
 
   def test_errors
     ["* * * *", "* * * * * *", "60 * * * *", "* 24 * * *", "* * 0 * *", "* * * 13 *", "* * * * 8",
-     "*/0 * * * *", "5-1 * * * *", "a * * * *", "1,,2 * * * *", "* * * FOO *", "@sometimes"].each do |bad|
+     "*/0 * * * *", "5-1 * * * *", "a * * * *", "1,,2 * * * *", "1, * * * *", ",1 * * * *", "* * * FOO *", "@sometimes"].each do |bad|
       refused = begin
         Divider::Cron.parse(bad)
         false
@@ -131,7 +135,9 @@ class CronTest < Test::Case
         w.shutdown
         t.await
       end
-      assert_equal(1, repo.query("SELECT count(*) FROM ct_runs") { |r| r.int(0) }[0])
+      # (Two when a minute began between two checks.)
+      n = repo.query("SELECT count(*) FROM ct_runs") { |r| r.int(0) }[0]
+      assert_true(n >= 1 && n <= 2, "runs: #{n}")
     end
   end
 end

@@ -14,7 +14,9 @@
 # or JAN-DEC), day of the week (0-7, 0 and 7 Sunday, or SUN-SAT); each a
 # `*`, a number, a range `a-b`, a step `*/n` or `a-b/n`, or a list of those
 # separated by commas. When both the day of the month and the day of the
-# week are restricted, a day matching either is due (as cron does).
+# week are restricted, a day matching either is due; a field that starts
+# with `*` (`*/2` too) counts as unrestricted there, as Vixie cron and
+# cronie take it (`0 0 */2 * MON`: odd days that are Mondays).
 # `@yearly` (`@annually`), `@monthly`, `@weekly`, `@daily` (`@midnight`)
 # and `@hourly` stand for their usual expressions.
 #
@@ -87,13 +89,16 @@ class Cron
     wdays = Cron.field(fields[4], 0, 7, "day of the week", WDAYS)
     # (7 is Sunday too.)
     wdays = wdays.add(0) if wdays.include?(7)
-    Schedule.new(minutes, hours, days, months, wdays.delete(7), fields[2] == "*", fields[4] == "*")
+    # (A field starting with `*`, `*/2` too, counts as unrestricted for the
+    # day rule, as Vixie cron and cronie take it.)
+    Schedule.new(minutes, hours, days, months, wdays.delete(7), fields[2].start_with?("*"), fields[4].start_with?("*"))
   end
 
   # :nodoc:
   # The values of one field.
   def self.field(text: String, lo: Int, hi: Int, what: String, names: Hash[String, Int]) -> Set[Int]
     out = Set[Int].new
+    raise ArgumentError.new("an empty #{what} in #{text.inspect}") if text.start_with?(",") || text.end_with?(",")
     text.split(",").each do |part|
       raise ArgumentError.new("an empty #{what} in #{text.inspect}") if part.empty?
       range, slash, step_text = part.partition("/")
@@ -152,15 +157,9 @@ class Cron
       return false unless minutes.include?(t.min) && hours.include?(t.hour) && months.include?(t.month)
       day = days.include?(t.day)
       wday = wdays.include?(t.wday)
-      if any_day && any_wday
-        true
-      elsif any_day
-        wday
-      elsif any_wday
-        day
-      else
-        day || wday
-      end
+      # (Vixie cron: either field starred, both must match, `*/2` taken as
+      # its days; both restricted, either.)
+      any_day || any_wday ? day && wday : day || wday
     end
   end
 end

@@ -6,6 +6,15 @@ class TtNote < Divider::Job
   end
 end
 
+class TtOnceSnooze < Divider::Job
+  unique
+
+  def perform(job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO tt_runs (job_id) VALUES ($1)", [job.id])
+    raise Divider::Snooze.new(1.hour)
+  end
+end
+
 class TtSnooze < Divider::Job
   def perform(job: Divider::Context) -> Void
     raise Divider::Snooze.new(1.hour)
@@ -138,6 +147,46 @@ class TestingTest < Test::Case
       # The snoozing job, drained: scheduled again, not run twice.
       assert_equal(1, Divider::Testing.drain(repo, jobs: [TtSnooze]))
       assert_equal(0, Divider::Testing.drain(repo, jobs: [TtSnooze]))
+    end
+  end
+
+  def test_fake_ids_schedule_and_validation
+    with_repo do |repo|
+      Divider::Testing.fake { TtNote.enqueue(repo) }
+      later = Divider::Testing.fake do
+        first = TtNote.enqueue(repo, after: 1.hour)
+        assert_equal(-1, first.id)
+        assert_raise(ArgumentError) { TtNote.enqueue(repo, priority: 42) }
+        first
+      end
+      assert_equal(:scheduled, later.state)
+      assert_true(later.scheduled_at > Time.now + 59.minutes)
+    end
+  end
+
+  def test_inline_keeps_a_job_whose_transaction_is_open
+    with_repo do |repo|
+      Divider::Testing.inline(repo) do
+        repo.transaction do |tx|
+          TtNote.enqueue(tx)
+          # (Another connection: the first job's row is not visible yet.)
+          TtNote.enqueue(repo)
+          nil
+        end
+        nil
+      end
+      assert_equal(2, runs(repo))
+    end
+  end
+
+  def test_inline_does_not_run_a_live_unique_job_again
+    with_repo do |repo|
+      Divider::Testing.inline(repo) do
+        TtOnceSnooze.enqueue(repo)
+        TtOnceSnooze.enqueue(repo)
+        nil
+      end
+      assert_equal(1, runs(repo))
     end
   end
 

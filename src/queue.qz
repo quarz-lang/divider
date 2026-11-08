@@ -17,35 +17,38 @@ module Queue
   # is given instead, and nothing is inserted.
   def self.insert(repo: Rotor::Repo, job: New) -> Enqueued
     raise ArgumentError.new("enqueue takes at: or after:, not both") if job.at && job.after
+    p = job.priority
+    raise ArgumentError.new("a priority is 0 to 9, not #{p}") if p < 0 || p > 9
+    delay = job.after
+    raise ArgumentError.new("after: is not negative, not #{delay}") if delay && delay.to_ms < 0
     # (`Divider::Testing`: recorded instead, or run once inserted.)
     if (faked = Testing.faked(job))
       return faked
     end
-    e = Queue.insert_row(repo, job)
-    Testing.inserted(repo, e, job)
+    e, inserted = Queue.insert_row(repo, job)
+    Testing.inserted(repo, e, job) if inserted
     e
   end
 
-  # The insertion itself.
-  def self.insert_row(repo: Rotor::Repo, job: New) -> Enqueued
+  # The insertion itself: the job, and whether it was inserted (not a
+  # live one of its unique key).
+  def self.insert_row(repo: Rotor::Repo, job: New) -> [Enqueued, Bool]
     p = job.priority
-    raise ArgumentError.new("a priority is 0 to 9, not #{p}") if p < 0 || p > 9
     delay = job.after
     after_ms = delay ? delay.to_ms : nil
-    raise ArgumentError.new("after: is not negative, not #{delay}") if after_ms && after_ms < 0
     u = job.unique
     key = u ? Queue.key(repo, job, u) : nil
     3.times do
       found = repo.query(INSERT, [job.class_name, job.queue, job.args, p, job.at, after_ms, job.max_attempts, key]) do |r|
         Enqueued.new(r.int(0), r.string(1).to_sym, r.time(2))
       end
-      return found[0] unless found.empty?
+      return [found[0], true] unless found.empty?
       # (A live job holds the key.)
       live = repo.query("SELECT id, state, scheduled_at FROM divider_jobs WHERE unique_key = $1 " +
                         "AND state IN ('scheduled', 'available', 'running', 'failed')", [key]) do |r|
         Enqueued.new(r.int(0), r.string(1).to_sym, r.time(2))
       end
-      return live[0] unless live.empty?
+      return [live[0], false] unless live.empty?
       # (It ended between the two statements: insert again.)
     end
     raise Error.new("enqueue: the unique key of #{job.class_name} kept changing hands")

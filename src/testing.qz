@@ -28,6 +28,10 @@
 # end
 # ```
 #
+# Under `fake`, `unique` is not applied (each enqueue is recorded). Under
+# `inline`, a job enqueued `at:` or `after:` a time runs at once too, and a
+# unique enqueue that gives back a live job runs nothing.
+#
 # `inline` and `fake` set a mode for the whole process (Quarz has no
 # storage per task): they are not for tests run in parallel
 # (`quarz test --parallel`).
@@ -74,8 +78,13 @@ module Testing
     begin
       yield
     ensure
-      Testing.run_pending(repo)
-      STATE.update { |s| s.with(mode: :off, pending: Array[[Int, Type[Job]]].new) }
+      begin
+        # (Every transaction of the block is over: a job not found now
+        # was rolled back.)
+        Testing.run_pending(repo, true)
+      ensure
+        STATE.update { |s| s.with(mode: :off, pending: Array[[Int, Type[Job]]].new) }
+      end
     end
   end
 
@@ -125,7 +134,11 @@ module Testing
   def self.enter(mode: Symbol) -> Void
     STATE.update do |s|
       raise ArgumentError.new("Divider::Testing.#{mode} inside #{s.mode}") unless s.mode == :off
-      mode == :fake ? s.with(mode: mode, recorded: Array[Recorded].new) : s.with(mode: mode)
+      if mode == :fake
+        s.with(mode: mode, recorded: Array[Recorded].new, next_id: -1)
+      else
+        s.with(mode: mode, pending: Array[[Int, Type[Job]]].new)
+      end
     end
     nil
   end
@@ -133,42 +146,57 @@ module Testing
   # :nodoc:
   # In `fake`: `job` recorded, and its `Enqueued`; nil otherwise.
   def self.faked(job: Queue::New) -> Enqueued?
-    s = STATE.get
-    return nil unless s.mode == :fake
     id = 0
     STATE.update do |st|
-      id = st.next_id
-      rec = Recorded.new(job.class_name, job.queue, job.args, job.priority, job.at, job.after)
-      st.with(recorded: st.recorded + [rec], next_id: st.next_id - 1)
+      if st.mode == :fake
+        id = st.next_id
+        rec = Recorded.new(job.class_name, job.queue, job.args, job.priority, job.at, job.after)
+        st.with(recorded: st.recorded + [rec], next_id: st.next_id - 1)
+      else
+        id = 0
+        st
+      end
     end
-    at = job.at
-    Enqueued.new(id, at && at > Time.now ? :scheduled : :available, at || Time.now)
+    return nil if id == 0
+    now = Time.now
+    delay = job.after
+    due = job.at || (delay ? now + delay : now)
+    Enqueued.new(id, due > now ? :scheduled : :available, due)
   end
 
   # :nodoc:
   # In `inline`: runs `e` (or defers it, inside a transaction).
   def self.inserted(repo: Rotor::Repo, e: Enqueued, job: Queue::New) -> Void
     cls = job.job
-    return if cls.nil? || STATE.get.mode != :inline
-    STATE.update { |s| s.with(pending: s.pending + [[e.id, cls]]) }
-    Testing.run_pending(repo) unless repo.adapter.in_transaction?
-  end
-
-  # :nodoc:
-  def self.run_pending(repo: Rotor::Repo) -> Void
-    while true
-      next_one = Testing.take_pending
-      break if next_one.nil?
-      Testing.run_one(repo, next_one[0], {next_one[1].name => next_one[1]})
-    end
-  end
-
-  # :nodoc:
-  def self.take_pending -> [Int, Type[Job]]?
-    taken: [Int, Type[Job]]? = nil
+    return if cls.nil?
+    queued = false
     STATE.update do |s|
-      taken = s.pending.first?
-      taken ? s.with(pending: s.pending[1...s.pending.size]) : s
+      queued = s.mode == :inline
+      queued ? s.with(pending: s.pending + [[e.id, cls]]) : s
+    end
+    Testing.run_pending(repo, false) if queued && !repo.adapter.in_transaction?
+  end
+
+  # :nodoc:
+  # Runs the pending jobs. One not found is kept unless `final`: its
+  # transaction (on another connection) may not be over yet.
+  def self.run_pending(repo: Rotor::Repo, final: Bool) -> Void
+    taken = Testing.take_pending
+    kept: Array[[Int, Type[Job]]] = []
+    taken.each do |entry|
+      ran = Testing.run_one(repo, entry[0], {entry[1].name => entry[1]})
+      kept = kept + [entry] unless ran || final
+    end
+    STATE.update { |s| s.with(pending: kept + s.pending) } unless kept.empty?
+  end
+
+  # :nodoc:
+  # The pending jobs, taken out of the state.
+  def self.take_pending -> Array[[Int, Type[Job]]]
+    taken: Array[[Int, Type[Job]]] = []
+    STATE.update do |s|
+      taken = s.pending
+      s.with(pending: Array[[Int, Type[Job]]].new)
     end
     taken
   end
