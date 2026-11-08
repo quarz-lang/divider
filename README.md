@@ -44,7 +44,14 @@ type there is found when the worker decodes the job (`Divider::ArgsError`,
 discarded). `enqueue_args` takes an `Args` value, checked fully. For the
 same reason `args` checks that a field can be encoded by its outer class
 only: a nullable or union field, or a collection's elements, of a class
-that cannot (`Pen?`, `Array[Pen]`), is found at decoding too.
+that cannot (`Pen?`, `Array[Pen]`), is found at decoding too. A job
+with `args` also keeps the argument-less `enqueue(repo, at:, after:,
+priority:)` it inherits, which a call naming none of the arguments
+(`SendWelcome.enqueue(repo: repo)`) resolves to: it raises
+`ArgumentError` ("SendWelcome.enqueue takes its arguments (WelcomeArgs)
+as keywords, or a WelcomeArgs value with enqueue_args") when it runs,
+before inserting anything. A call that names an argument is checked at
+compile time.
 
 ## License
 
