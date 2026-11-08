@@ -34,8 +34,8 @@ class ArgsTest < Test::Case
     # the arguments, `enqueue(repo: repo)` is the inherited form, which
     # raises: test/fixtures/args_jobs.)
     assert_match(/main\.qz:64:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo, user_id: String\)/, text)
-    assert_match(/main\.qz:65:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo, user_id: Int, colour: String\)/, text)
-    assert_match(/main\.qz:66:39: error: argument `args` of enqueue_args\(.*\) expects Good but found Int/, text)
+    assert_match(/main\.qz:65:3: error: no overload of `enqueue` on Type\[Fine\] matches \(repo: Rotor::Repo, user_id: .*, colour: String\)/, text)
+    assert_match(/main\.qz:66:39: error: argument `args` of enqueue_args\(.*\) -> Divider::Enqueued expects Good but found Int/, text)
   end
 
   def test_jobs_with_arguments

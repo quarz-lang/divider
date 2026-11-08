@@ -7,3 +7,27 @@ end
 # worker's decoding, which raises it, comes with quarz-lang/quarz#400.)
 class ArgsError < Error
 end
+
+# Raised by a job's `perform` to discard the job: no retry, its message
+# recorded in the job's `errors`.
+class Discard < Error
+end
+
+# Raised by a job's `perform` to run it again after `delay`, without
+# counting the attempt.
+class Snooze < Error
+  @delay: Duration
+
+  def initialize(delay: Duration)
+    @delay = delay
+    super("snoozed for #{delay}")
+  end
+
+  # How long to put the job off.
+  def delay -> Duration = @delay
+end
+
+# Raised by a job's `perform` that stops because its cancellation was
+# requested (`job.cancel_requested?`): the job ends `cancelled`.
+class Cancelled < Error
+end
