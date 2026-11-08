@@ -2,6 +2,8 @@
 name = "divider"
 version = "0.1.0"
 module = "Divider"
+documentation = "https://divider.api.quarz.dev"
+repository = "https://github.com/quarz-lang/divider"
 
 [dependencies]
 Rotor = { git = "https://github.com/quarz-lang/rotor", branch = "main" }
