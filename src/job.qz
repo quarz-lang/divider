@@ -186,7 +186,7 @@ abstract class Job
   # raises `ArgumentError`.
   def self.enqueue(repo: Rotor::Repo, *, at: Time? = nil, after: Duration? = nil, priority: Int = 5) -> Enqueued
     if t = job_args_type
-      raise ArgumentError.new("#{name}.enqueue takes its arguments (#{t.name}) as keywords, or an #{t.name} with enqueue_args")
+      raise ArgumentError.new("#{name}.enqueue takes its arguments (#{t.name}) as keywords, or a #{t.name} value with enqueue_args")
     end
     Queue.insert(repo, Queue::New.new(name, job_queue, "{}", priority, at, after, job_max_attempts, job_unique))
   end
