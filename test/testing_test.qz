@@ -1,0 +1,226 @@
+require "test"
+
+class TtNote < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO tt_runs (job_id) VALUES ($1)", [job.id])
+  end
+end
+
+# Enqueues a TtNote in a transaction of its own.
+class TtChain < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    job.repo.transaction do |tx|
+      TtNote.enqueue(tx)
+      nil
+    end
+  end
+end
+
+class TtOnceSnooze < Divider::Job
+  unique
+
+  def perform(job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO tt_runs (job_id) VALUES ($1)", [job.id])
+    raise Divider::Snooze.new(1.hour)
+  end
+end
+
+class TtSnooze < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    raise Divider::Snooze.new(1.hour)
+  end
+end
+
+# `Divider::Testing`: fake, inline (in and out of transactions) and drain.
+class TestingTest < Test::Case
+  include Divider::Testing::Assertions
+
+  def with_repo(&: (Rotor::Repo) -> Void) -> Void
+    PG::Testing.with_cluster do |url|
+      PG::Pool.open(url, 2) do |pool|
+        repo = Rotor::Repo.new(pool: pool)
+        TestingTest.reset(repo)
+        begin
+          Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_tt_versions").migrate
+          repo.exec("CREATE TABLE tt_runs (job_id bigint PRIMARY KEY)")
+          yield repo
+        ensure
+          TestingTest.reset(repo)
+        end
+      end
+    end
+  rescue PG::Testing::Unavailable => e
+    omit(e.message)
+  end
+
+  def self.reset(repo: Rotor::Repo) -> Void
+    repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_tt_versions, tt_runs")
+  end
+
+  def runs(repo: Rotor::Repo) -> Int = repo.query("SELECT count(*) FROM tt_runs") { |r| r.int(0) }[0]
+
+  def count(repo: Rotor::Repo) -> Int = repo.query("SELECT count(*) FROM divider_jobs") { |r| r.int(0) }[0]
+
+  def test_fake_records_without_inserting
+    with_repo do |repo|
+      ids = Divider::Testing.fake do
+        a = TtNote.enqueue(repo)
+        b = TtNote.enqueue(repo, at: Time.utc(2099, 1, 1), priority: 2)
+        assert_enqueued(TtNote)
+        refute_enqueued(TtSnooze)
+        [a, b]
+      end
+      assert_equal([-1, -2], ids.map(&:id))
+      assert_equal([:available, :scheduled], ids.map(&:state))
+      assert_equal(0, count(repo))
+      recorded = Divider::Testing.enqueued(TtNote)
+      assert_equal(2, recorded.size)
+      assert_equal([5, 2], recorded.map(&:priority))
+      assert_equal(Time.utc(2099, 1, 1), recorded[1].at)
+      # A failed assertion names what was recorded.
+      message = begin
+        assert_enqueued(TtSnooze)
+        ""
+      rescue Test::AssertionFailed => e
+        e.message
+      end
+      assert_match(/no TtSnooze enqueued/, message)
+      # Outside `fake`, enqueues insert again.
+      TtNote.enqueue(repo)
+      assert_equal(1, count(repo))
+    end
+  end
+
+  def test_assert_enqueued_compares_arguments_as_json
+    stored = "{\"user_id\": 42, \"tags\": [\"a\"], \"at\": null}"
+    assert_true(Divider::Testing.args_match?(stored, {user_id: 42}))
+    assert_true(Divider::Testing.args_match?(stored, {tags: ["a"], user_id: 42}))
+    assert_true(Divider::Testing.args_match?(stored, {at: nil}))
+    assert_false(Divider::Testing.args_match?(stored, {user_id: 43}))
+    assert_false(Divider::Testing.args_match?(stored, {missing: 1}))
+    none: Hash[Symbol, Object] = {}
+    assert_true(Divider::Testing.args_match?(stored, none))
+  end
+
+  def test_inline_runs_at_once_outside_a_transaction
+    with_repo do |repo|
+      Divider::Testing.inline(repo) do
+        TtNote.enqueue(repo)
+        assert_equal(1, runs(repo))
+        # A snooze leaves the job scheduled, not run again.
+        s = TtSnooze.enqueue(repo)
+        assert_equal("scheduled", repo.query("SELECT state FROM divider_jobs WHERE id = $1", [s.id]) { |r| r.string(0) }[0])
+      end
+      assert_equal(["completed"], repo.query("SELECT state FROM divider_jobs WHERE class = 'TtNote'") { |r| r.string(0) })
+    end
+  end
+
+  def test_inline_defers_a_job_of_a_transaction
+    with_repo do |repo|
+      Divider::Testing.inline(repo) do
+        repo.transaction do |tx|
+          TtNote.enqueue(tx)
+          nil
+        end
+        # (Committed: run at the next enqueue outside a transaction.)
+        assert_equal(0, runs(repo))
+        TtNote.enqueue(repo)
+        assert_equal(2, runs(repo))
+        # Rolled back: never run; committed at the block's end: run then.
+        begin
+          repo.transaction do |tx|
+            TtNote.enqueue(tx)
+            raise ArgumentError.new("roll back")
+          end
+        rescue ArgumentError
+          nil
+        end
+        repo.transaction do |tx|
+          TtNote.enqueue(tx)
+          nil
+        end
+        assert_equal(2, runs(repo))
+      end
+      assert_equal(3, runs(repo))
+    end
+  end
+
+  def test_drain_runs_what_is_due_once
+    with_repo do |repo|
+      3.times { TtNote.enqueue(repo) }
+      later = TtNote.enqueue(repo, after: 1.hour)
+      TtSnooze.enqueue(repo)
+      assert_equal(3, Divider::Testing.drain(repo, jobs: [TtNote]))
+      assert_equal(3, runs(repo))
+      assert_equal("scheduled", repo.query("SELECT state FROM divider_jobs WHERE id = $1", [later.id]) { |r| r.string(0) }[0])
+      assert_equal(0, Divider::Testing.drain(repo, jobs: [TtNote]))
+      # The snoozing job, drained: scheduled again, not run twice.
+      assert_equal(1, Divider::Testing.drain(repo, jobs: [TtSnooze]))
+      assert_equal(0, Divider::Testing.drain(repo, jobs: [TtSnooze]))
+    end
+  end
+
+  def test_fake_ids_schedule_and_validation
+    with_repo do |repo|
+      Divider::Testing.fake { TtNote.enqueue(repo) }
+      later = Divider::Testing.fake do
+        first = TtNote.enqueue(repo, after: 1.hour)
+        assert_equal(-1, first.id)
+        assert_raise(ArgumentError) { TtNote.enqueue(repo, priority: 42) }
+        first
+      end
+      assert_equal(:scheduled, later.state)
+      assert_true(later.scheduled_at > Time.now + 59.minutes)
+    end
+  end
+
+  def test_inline_keeps_a_job_whose_transaction_is_open
+    with_repo do |repo|
+      Divider::Testing.inline(repo) do
+        repo.transaction do |tx|
+          TtNote.enqueue(tx)
+          # (Another connection: the first job's row is not visible yet.)
+          TtNote.enqueue(repo)
+          nil
+        end
+        nil
+      end
+      assert_equal(2, runs(repo))
+    end
+  end
+
+  def test_inline_runs_what_its_last_jobs_enqueue
+    with_repo do |repo|
+      Divider::Testing.inline(repo) do
+        repo.transaction do |tx|
+          TtChain.enqueue(tx)
+          nil
+        end
+        nil
+      end
+      # (TtChain ran at the block's end, and the TtNote it enqueued too.)
+      assert_equal(1, runs(repo))
+      assert_equal(["completed", "completed"], repo.query("SELECT state FROM divider_jobs ORDER BY id") { |r| r.string(0) })
+    end
+  end
+
+  def test_inline_does_not_run_a_live_unique_job_again
+    with_repo do |repo|
+      Divider::Testing.inline(repo) do
+        TtOnceSnooze.enqueue(repo)
+        TtOnceSnooze.enqueue(repo)
+        nil
+      end
+      assert_equal(1, runs(repo))
+    end
+  end
+
+  def test_modes_do_not_nest
+    with_repo do |repo|
+      Divider::Testing.fake do
+        assert_raise(ArgumentError) { Divider::Testing.inline(repo) { nil } }
+        nil
+      end
+    end
+  end
+end

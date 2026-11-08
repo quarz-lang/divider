@@ -45,6 +45,7 @@ class Worker
   @keep_discarded: Duration
   @on_error: (shareable (Exception, Context) -> Void)?
   @on_event: (shareable (Event) -> Void)?
+  @cron: Cron?
   # Closed by `shutdown`: the dispatchers stop fetching.
   @stop: Channel[Nil]
   # Closed by a second `shutdown`: the running jobs are cancelled at once.
@@ -58,7 +59,8 @@ class Worker
 
   # A worker of `jobs` (the classes it may run) over the database `url`,
   # running `queues` (each queue's name, and how many of its jobs run at
-  # once). `node` names this process in the rows it runs (by default
+  # once), and the recurring jobs of `cron`. `node` names this process in
+  # the rows it runs (by default
   # `HOSTNAME-pid-` and a random suffix): it must differ from every other
   # running worker's.
   def initialize(@url: String, *, jobs: Array[Type[Job]], queues: Hash[Symbol, Int] = {default: 10},
@@ -66,7 +68,7 @@ class Worker
                  @heartbeat: Duration = 30.seconds, @stale_after: Duration = 5.minutes,
                  @keep_completed: Duration = 7.days, @keep_discarded: Duration = 30.days,
                  @on_error: (shareable (Exception, Context) -> Void)? = nil,
-                 @on_event: (shareable (Event) -> Void)? = nil)
+                 @on_event: (shareable (Event) -> Void)? = nil, @cron: Cron? = nil)
     raise ArgumentError.new("a worker runs at least one queue") if queues.empty?
     raise ArgumentError.new("a worker runs at least one job class") if jobs.empty?
     by_name: Hash[String, Type[Job]] = {}
@@ -116,6 +118,7 @@ class Worker
         # are done, their grace included.)
         done = Channel[Nil].new
         outer.spawn { w.maintain(done) }
+        outer.spawn { w.schedule(done) } if @cron
         begin
           Task.scope do |s|
             @queues.each_pair do |q, n|
@@ -223,7 +226,7 @@ class Worker
             end
           rescue Task::Cancelled => c
             # (Fetched, not spawned: given back.)
-            fetched.each_with_index { |row, i| release(row) if i >= spawned }
+            fetched.each_with_index { |row, i| runner.release(row) if i >= spawned }
             raise c
           end
           # (Forget the attempts that began.)
@@ -275,7 +278,7 @@ class Worker
     ensure
       Task.uncancellable do
         seen = begun.get
-        unstarted.each { |r| release(r[1]) unless seen.include?(r[0]) }
+        unstarted.each { |r| runner.release(r[1]) unless seen.include?(r[0]) }
       end
     end
   end
@@ -288,13 +291,14 @@ class Worker
     begun.update { |b| b.add(key) }
     @running.update { |r| r.add(row.id) }
     begin
+      r = runner
       outcome = begin
-        run_attempt(row)
+        r.run_attempt(row)
       rescue Task::Cancelled => c
-        release(row)
+        r.release(row)
         raise c
       end
-      record(row, outcome)
+      r.record(row, outcome)
     rescue Task::Cancelled => c
       raise c
     rescue Exception => e
@@ -311,117 +315,33 @@ class Worker
   end
 
   # :nodoc:
-  # Runs the job and tells how its attempt ended; raises `Task::Cancelled`
-  # only when the worker cancelled it.
-  def run_attempt(row: Fetched) -> Outcome
-    ctx = Context.new(row.id, row.class_name, row.queue, row.attempt, row.max_attempts, row.inserted_at, row.scheduled_at, @pool)
-    started = Time.now
-    begin
-      emit(:started, row, nil, nil)
-      cls = @jobs[row.class_name]
-      limit = cls.job_timeout_ms
-      if limit
-        Task.timeout(limit.ms) { cls.run_job(ctx, row.args) }
-      else
-        cls.run_job(ctx, row.args)
-      end
-      Outcome.new(@keep_completed.to_ms == 0 ? FINISH_DELETE : FINISH_COMPLETED, nil, nil, :completed, Worker.ms_since(started), nil)
-    rescue Task::Cancelled => c
-      # (A job that lets a cancellation of its own escape, such as an
-      # `await` of a cancelled task, failed; the worker's is not this.)
-      raise c if Task.current.cancelled?
-      failure(row, ctx, c, started)
-    rescue Exception => e
-      # (A job that swallowed the worker's cancellation: still that.)
-      Task.check_cancel
-      failure(row, ctx, e, started)
-    end
-  end
+  # A runner of attempts over the worker's pool (made in the task that
+  # uses it: a repository is not Shareable).
+  def runner -> Runner = Runner.new(Rotor::Repo.new(pool: @pool), @jobs, @node, @keep_completed.to_ms, @on_error, @on_event)
 
   # :nodoc:
-  # How an attempt that raised `e` ended: cancelled when that was asked
-  # (`Divider::Cancelled`, or anything after `Divider.cancel`), put off
-  # (`Snooze`), discarded (`Discard`, `ArgsError`, or the last attempt's
-  # failure), else failed and retried later.
-  def failure(row: Fetched, ctx: Context, e: Exception, started: Time) -> Outcome
-    ms = Worker.ms_since(started)
-    err = error_json(row, e)
-    requested = begin
-      ctx.cancel_requested?
-    rescue StandardError
-      false
-    end
-    if requested || e.is_a?(Cancelled)
-      return Outcome.new(FINISH_CANCELLED, err, nil, :cancelled, ms, e.message)
-    end
-    case e
-    in Snooze => snooze
-      Outcome.new(FINISH_SNOOZED, nil, snooze.delay.to_ms, :snoozed, ms, e.message)
-    in Discard | ArgsError
-      Outcome.new(FINISH_DISCARDED, err, nil, :discarded, ms, e.message)
-    else
-      report(e, ctx)
-      if row.attempt >= row.max_attempts
-        Outcome.new(FINISH_DISCARDED, err, nil, :discarded, ms, e.message)
-      else
-        Outcome.new(FINISH_FAILED, err, Worker.backoff(row.attempt), :failed, ms, e.message)
-      end
-    end
-  end
-
-  # :nodoc:
-  # Writes how the attempt ended (out of reach of a cancellation, for at
-  # most `RECORD_LIMIT`: a row left `running` is rescued later), then
-  # tells `on_event`.
-  def record(row: Fetched, o: Outcome) -> Void
-    written = Task.uncancellable do
+  # The cron entries: every `CRON_CHECK`, until `done` is closed, those
+  # due at the database's current minute.
+  def schedule(done: Channel[Nil]) -> Void
+    cron = @cron
+    return if cron.nil?
+    repo = Rotor::Repo.new(pool: @pool)
+    while true
       begin
-        Task.timeout(RECORD_LIMIT) do
-          params: Array[Object?] = [row.id, @node, row.attempt]
-          if o.sql == FINISH_SNOOZED
-            params = params + [o.number]
-          elsif o.sql == FINISH_FAILED
-            params = params + [o.error_json, o.number]
-          elsif o.error_json
-            params = params + [o.error_json]
-          end
-          # (The state the row took: a cancellation asked meanwhile
-          # makes it `cancelled`; none when another node rescued it.)
-          Rotor::Repo.new(pool: @pool).query(o.sql + " RETURNING state", params) { |r| r.string(0) }.first?
-        end
+        minute = repo.query("SELECT date_trunc('minute', now())") { |r| r.time(0) }[0]
+        cron.tick(repo, minute)
       rescue StandardError => e
-        STDERR.puts "divider: recording job #{row.id} as #{o.kind} failed (#{e.class.name}: #{e.message}); it is rescued later"
-        nil
+        STDERR.puts "divider: enqueueing the cron entries failed: #{e.class.name}: #{e.message}"
       end
-    end
-    return if written.nil?
-    # (A row deleted at once, `keep_completed` 0, gives its `running`.)
-    kind = case written
-           when "completed", "running" then :completed
-           when "failed" then :failed
-           when "scheduled" then :snoozed
-           when "discarded" then :discarded
-           else :cancelled
-           end
-    emit(kind, row, o.ms, o.message)
-  end
-
-  # :nodoc:
-  # Gives `row` back after the worker cancelled its attempt: `available`
-  # with the attempt not counted, or `cancelled` when that was asked.
-  def release(row: Fetched) -> Void
-    Task.uncancellable do
       begin
-        Task.timeout(RECORD_LIMIT) do
-          Rotor::Repo.new(pool: @pool).exec(FINISH_RELEASED, [row.id, @node, row.attempt])
-          nil
+        Channel.select do |sel|
+          sel.receive(done) { |_| nil }
+          sel.after(CRON_CHECK) { nil }
         end
-      rescue StandardError => e
-        STDERR.puts "divider: giving job #{row.id} back failed (#{e.class.name}: #{e.message}); it is rescued later"
-        nil
+      rescue Channel::Closed
+        return
       end
     end
-    nil
   end
 
   # :nodoc:
@@ -466,7 +386,8 @@ class Worker
       end
       nil
     end
-    rescued.each { |row| emit(:rescued, row, nil, nil) }
+    r = runner
+    rescued.each { |row| r.emit(:rescued, row, nil, nil) }
   end
 
   # :nodoc:
@@ -492,39 +413,6 @@ class Worker
   end
 
   # :nodoc:
-  def error_json(row: Fetched, e: Exception) -> String
-    JSON.generate({"attempt" => row.attempt, "error" => e.class.name, "message" => e.message,
-                   "backtrace" => e.backtrace.first(10)})
-  end
-
-  # :nodoc:
-  # `on_error`, or the error on standard error.
-  def report(e: Exception, ctx: Context) -> Void
-    if (h = @on_error)
-      begin
-        h.call(e, ctx)
-      rescue Exception => he
-        Task.check_cancel
-        STDERR.puts "divider: on_error raised #{he.class.name}: #{he.message}"
-      end
-    else
-      STDERR.puts "divider: #{ctx.class_name} (job #{ctx.id}, attempt #{ctx.attempt}/#{ctx.max_attempts}) raised #{e.class.name}: #{e.message}"
-    end
-  end
-
-  # :nodoc:
-  def emit(kind: Symbol, row: Fetched, ms: Int?, error: String?) -> Void
-    h = @on_event
-    return if h.nil?
-    begin
-      h.call(Event.new(kind, row.id, row.class_name, row.queue, row.attempt, ms, error))
-    rescue Exception => e
-      Task.check_cancel
-      STDERR.puts "divider: on_event raised #{e.class.name}: #{e.message}"
-    end
-  end
-
-  # :nodoc:
   # The delay before attempt `attempt + 1`, in milliseconds: Oban's
   # `attempt ** 4 + 15` seconds plus a random 0 to 30.
   def self.backoff(attempt: Int) -> Int = ((attempt > 100 ? 100 : attempt) ** 4 + 15 + Random.rand(31)) * 1000
@@ -540,6 +428,9 @@ class Worker
 
   # The longest a row's update after an attempt, or a fetch, may take.
   RECORD_LIMIT = 30.seconds
+
+  # How often the cron entries are checked.
+  CRON_CHECK = 15.seconds
 
   # The longest the listener waits for a notification at once.
   LISTEN_WAIT = 500.ms
@@ -619,8 +510,8 @@ data Event = (kind: Symbol, id: Int, class_name: String, queue: String, attempt:
 public def serve(url: String, *, jobs: Array[Type[Job]], queues: Hash[Symbol, Int] = {default: 10},
                  grace: Duration = 25.seconds, node: String? = nil, poll: Duration = 1.second,
                  on_error: (shareable (Exception, Context) -> Void)? = nil,
-                 on_event: (shareable (Event) -> Void)? = nil) -> Void
-  worker = Worker.new(url, jobs: jobs, queues: queues, node: node, poll: poll, on_error: on_error, on_event: on_event)
+                 on_event: (shareable (Event) -> Void)? = nil, cron: Cron? = nil) -> Void
+  worker = Worker.new(url, jobs: jobs, queues: queues, node: node, poll: poll, on_error: on_error, on_event: on_event, cron: cron)
   Signal.trap(:TERM) { worker.shutdown(grace) }
   Signal.trap(:INT) { worker.shutdown(grace) }
   worker.run

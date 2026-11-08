@@ -47,12 +47,12 @@ begin
   PG::Testing.with_cluster do |url|
     PG::Pool.open(url, 1) do |pool|
       repo = Rotor::Repo.new(pool: pool)
-      repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_args_versions")
+      repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_args_versions")
       begin
         Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_args_versions").migrate
         run(repo)
       ensure
-        repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_args_versions")
+        repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_args_versions")
       end
     end
   end

@@ -1,0 +1,143 @@
+require "test"
+
+class CtTick < Divider::Job
+  queue :cron
+end
+
+class CtCount < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO ct_runs (job_id) VALUES ($1)", [job.id])
+  end
+end
+
+# Cron expressions, what is due when, and the ticks against a server:
+# one job per entry and minute, however many workers tick.
+class CronTest < Test::Case
+  def due?(expr: String, t: Time) -> Bool = Divider::Cron.parse(expr).match?(t)
+
+  def test_fields
+    t = Time.utc(2026, 11, 8, 14, 30)   # a Sunday
+    assert_true(due?("* * * * *", t))
+    assert_true(due?("30 14 * * *", t))
+    assert_false(due?("31 14 * * *", t))
+    assert_true(due?("*/15 * * * *", t))
+    assert_false(due?("*/7 * * * *", t))
+    assert_true(due?("0-45/15 14 * * *", t))
+    assert_true(due?("5/25 * * * *", t))       # 5, 30, 55
+    assert_true(due?("10,20,30 * * * *", t))
+    assert_true(due?("30 14 8 11 *", t))
+    assert_true(due?("30 14 * NOV *", t))
+    assert_true(due?("30 14 * * SUN", t))
+    assert_true(due?("30 14 * * 7", t))
+    assert_true(due?("30 14 * * 0", t))
+    assert_false(due?("30 14 * * MON-FRI", t))
+    # Both days restricted: either matches.
+    assert_true(due?("30 14 1 * SUN", t))
+    assert_true(due?("30 14 8 * MON", t))
+    assert_false(due?("30 14 1 * MON", t))
+    # A stepped star counts as unrestricted (Vixie cron): odd days that
+    # are Mondays, not odd days or Mondays.
+    assert_false(due?("0 0 */2 * MON", Time.utc(2026, 11, 16)))
+    assert_true(due?("0 0 */2 * MON", Time.utc(2026, 11, 9)))
+    # Macros.
+    assert_true(due?("@hourly", Time.utc(2026, 11, 8, 3, 0)))
+    assert_true(due?("@daily", Time.utc(2026, 11, 8, 0, 0)))
+    assert_true(due?("@midnight", Time.utc(2026, 11, 8, 0, 0)))
+    assert_true(due?("@weekly", Time.utc(2026, 11, 8, 0, 0)))
+    assert_false(due?("@weekly", Time.utc(2026, 11, 9, 0, 0)))
+    assert_true(due?("@monthly", Time.utc(2026, 12, 1, 0, 0)))
+    assert_true(due?("@yearly", Time.utc(2027, 1, 1, 0, 0)))
+    assert_true(due?("@annually", Time.utc(2027, 1, 1, 0, 0)))
+    # Seconds are ignored; the time is taken in UTC.
+    assert_true(due?("30 14 * * *", Time.utc(2026, 11, 8, 14, 30, 59)))
+  end
+
+  def test_errors
+    ["* * * *", "* * * * * *", "60 * * * *", "* 24 * * *", "* * 0 * *", "* * * 13 *", "* * * * 8",
+     "*/0 * * * *", "5-1 * * * *", "a * * * *", "1,,2 * * * *", "1, * * * *", ",1 * * * *", "* * * FOO *", "@sometimes"].each do |bad|
+      refused = begin
+        Divider::Cron.parse(bad)
+        false
+      rescue ArgumentError
+        true
+      end
+      assert_true(refused, bad)
+    end
+  end
+
+  def test_due_entries
+    cron = Divider::Cron.new([Divider::Cron.entry("*/5 * * * *", CtTick), Divider::Cron.entry("0 3 * * *", CtTick, scope: "daily")])
+    assert_equal(2, cron.due(Time.utc(2026, 11, 8, 3, 0)).size)
+    assert_equal(1, cron.due(Time.utc(2026, 11, 8, 3, 5)).size)
+    assert_equal("{\"scope\":\"daily\"}", cron.entries[1].args)
+    assert_equal("CtTick", cron.entries[1].job.name)
+  end
+
+  def with_repo(&: (Rotor::Repo, String) -> Void) -> Void
+    PG::Testing.with_cluster do |url|
+      PG::Pool.open(url, 2) do |pool|
+        repo = Rotor::Repo.new(pool: pool)
+        CronTest.reset(repo)
+        begin
+          Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_ct_versions").migrate
+          repo.exec("CREATE TABLE ct_runs (job_id bigint PRIMARY KEY)")
+          yield repo, url
+        ensure
+          CronTest.reset(repo)
+        end
+      end
+    end
+  rescue PG::Testing::Unavailable => e
+    omit(e.message)
+  end
+
+  def self.reset(repo: Rotor::Repo) -> Void
+    repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_ct_versions, ct_runs")
+  end
+
+  def jobs(repo: Rotor::Repo) -> Array[String]
+    repo.query("SELECT class || ' ' || queue || ' ' || args::text FROM divider_jobs ORDER BY id") { |r| r.string(0) }
+  end
+
+  def test_ticks_enqueue_once_per_minute
+    with_repo do |repo, _|
+      cron = Divider::Cron.new([Divider::Cron.entry("*/5 * * * *", CtTick), Divider::Cron.entry("0 3 * * *", CtTick, scope: "daily")])
+      other = Divider::Cron.new(cron.entries)
+      three = Time.utc(2026, 11, 8, 3, 0)
+      assert_equal(2, cron.tick(repo, three))
+      # Again, and from another worker: nothing more.
+      assert_equal(0, cron.tick(repo, three))
+      assert_equal(0, other.tick(repo, three))
+      assert_equal(["CtTick cron {}", "CtTick cron {\"scope\": \"daily\"}"], jobs(repo))
+      # Even once the jobs are done.
+      repo.exec("UPDATE divider_jobs SET state = 'completed'")
+      assert_equal(0, cron.tick(repo, three))
+      # The next due minute.
+      assert_equal(0, cron.tick(repo, Time.utc(2026, 11, 8, 3, 1)))
+      assert_equal(1, other.tick(repo, Time.utc(2026, 11, 8, 3, 5)))
+      # An earlier minute (a slow worker's tick) is not enqueued again.
+      assert_equal(0, cron.tick(repo, three))
+      assert_equal(3, jobs(repo).size)
+    end
+  end
+
+  def test_a_worker_ticks
+    with_repo do |repo, url|
+      cron = Divider::Cron.new([Divider::Cron.entry("* * * * *", CtCount)])
+      w = Divider::Worker.new(url, jobs: [CtCount], poll: 50.ms, node: "ct", cron: cron)
+      t = Task.spawn { w.run }
+      begin
+        200.times do
+          break if repo.query("SELECT count(*) FROM ct_runs") { |r| r.int(0) }[0] >= 1
+          Task.sleep(50.ms)
+        end
+      ensure
+        w.shutdown
+        t.await
+      end
+      # (Two when a minute began between two checks.)
+      n = repo.query("SELECT count(*) FROM ct_runs") { |r| r.int(0) }[0]
+      assert_true(n >= 1 && n <= 2, "runs: #{n}")
+    end
+  end
+end

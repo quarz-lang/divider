@@ -1,0 +1,165 @@
+# Recurring jobs: entries of a five-field cron expression, in UTC, and a
+# job class (with its arguments), which a worker enqueues when they are
+# due (`Worker.new(url, ..., cron: cron)`).
+#
+# ```
+# cron = Divider::Cron.new([Divider::Cron.entry("*/5 * * * *", Divider::Job),
+#                           Divider::Cron.entry("@daily", Divider::Job)])
+# cron.due(Time.utc(2026, 11, 8, 0, 0)).size     # => 2
+# cron.due(Time.utc(2026, 11, 8, 0, 5)).size     # => 1
+# cron.due(Time.utc(2026, 11, 8, 0, 7)).size     # => 0
+# ```
+#
+# Fields: minute (0-59), hour (0-23), day of the month (1-31), month (1-12
+# or JAN-DEC), day of the week (0-7, 0 and 7 Sunday, or SUN-SAT); each a
+# `*`, a number, a range `a-b`, a step `*/n` or `a-b/n`, or a list of those
+# separated by commas. When both the day of the month and the day of the
+# week are restricted, a day matching either is due; a field that starts
+# with `*` (`*/2` too) counts as unrestricted there, as Vixie cron and
+# cronie take it (`0 0 */2 * MON`: odd days that are Mondays).
+# `@yearly` (`@annually`), `@monthly`, `@weekly`, `@daily` (`@midnight`)
+# and `@hourly` stand for their usual expressions.
+#
+# A worker checks every 15 seconds, by the database's clock, and enqueues
+# each entry once per due minute however many workers check: a minute no
+# worker checked (all of them stopped) is not made up afterwards.
+class Cron
+  include Shareable
+
+  @entries: Array[Entry]
+
+  # A schedule of `entries`.
+  def initialize(@entries: Array[Entry])
+  end
+
+  # The entries.
+  def entries -> Array[Entry] = @entries
+
+  # An entry: `job` enqueued, with `args` (its arguments as keywords,
+  # JSON-encoded now; checked when the job is decoded), at each minute
+  # `expression` matches. `ArgumentError` for an expression that does not
+  # parse.
+  def self.entry(expression: String, job: Type[Job], **args: Object) -> Entry
+    values: Hash[String, Object] = {}
+    args.each_pair { |k, v| values = values.put(k.to_s, v) }
+    Entry.new(expression, job, JSON.generate(values), Cron.parse(expression))
+  end
+
+  # The entries due at the minute of `at` (UTC; seconds ignored).
+  def due(at: Time) -> Array[Entry]
+    t = at.utc
+    @entries.select { |e| e.schedule.match?(t) }
+  end
+
+  # :nodoc:
+  # Enqueues the entries due at the minute `minute` that no worker has
+  # enqueued for it yet; how many it enqueued.
+  def tick(repo: Rotor::Repo, minute: Time) -> Int
+    n = 0
+    due(minute).each do |e|
+      key = Digest::SHA256.hexdigest("#{e.expression}\n#{e.job.name}\n#{e.args}")
+      repo.transaction do |tx|
+        won = tx.query(CLAIM, [key, minute]) { |r| r.string(0) }
+        unless won.empty?
+          cls = e.job
+          Queue.insert(tx, Queue::New.new(cls.name, cls.job_queue, e.args, 5, nil, nil, cls.job_max_attempts, cls.job_unique, cls))
+          n += 1
+        end
+        nil
+      end
+    end
+    n
+  end
+
+  # (One row per entry: the last minute it was enqueued for. Only the
+  # worker that moves it forward enqueues.)
+  CLAIM = "INSERT INTO divider_cron (key, last_minute) VALUES ($1, $2) " +
+          "ON CONFLICT (key) DO UPDATE SET last_minute = EXCLUDED.last_minute " +
+          "WHERE divider_cron.last_minute < EXCLUDED.last_minute RETURNING key"
+
+  # The schedule of `expression`; `ArgumentError` when it does not parse.
+  def self.parse(expression: String) -> Schedule
+    text = MACROS[expression.strip.downcase]? || expression
+    fields = text.strip.split(/\s+/)
+    raise ArgumentError.new("a cron expression has five fields, not #{fields.size}: #{expression.inspect}") unless fields.size == 5
+    minutes = Cron.field(fields[0], 0, 59, "minute", NO_NAMES)
+    hours = Cron.field(fields[1], 0, 23, "hour", NO_NAMES)
+    days = Cron.field(fields[2], 1, 31, "day of the month", NO_NAMES)
+    months = Cron.field(fields[3], 1, 12, "month", MONTHS)
+    wdays = Cron.field(fields[4], 0, 7, "day of the week", WDAYS)
+    # (7 is Sunday too.)
+    wdays = wdays.add(0) if wdays.include?(7)
+    # (A field starting with `*`, `*/2` too, counts as unrestricted for the
+    # day rule, as Vixie cron and cronie take it.)
+    Schedule.new(minutes, hours, days, months, wdays.delete(7), fields[2].start_with?("*"), fields[4].start_with?("*"))
+  end
+
+  # :nodoc:
+  # The values of one field.
+  def self.field(text: String, lo: Int, hi: Int, what: String, names: Hash[String, Int]) -> Set[Int]
+    out = Set[Int].new
+    raise ArgumentError.new("an empty #{what} in #{text.inspect}") if text.start_with?(",") || text.end_with?(",")
+    text.split(",").each do |part|
+      raise ArgumentError.new("an empty #{what} in #{text.inspect}") if part.empty?
+      range, slash, step_text = part.partition("/")
+      step = 1
+      unless slash.empty?
+        raise ArgumentError.new("the #{what} step #{step_text.inspect} is not a number") unless step_text.match?(/\A[0-9]+\z/)
+        step = step_text.to_i
+        raise ArgumentError.new("the #{what} step is at least 1") if step < 1
+      end
+      first, last = if range == "*"
+                      [lo, hi]
+                    elsif range.include?("-")
+                      a, _, b = range.partition("-")
+                      [Cron.value(a, lo, hi, what, names), Cron.value(b, lo, hi, what, names)]
+                    else
+                      v = Cron.value(range, lo, hi, what, names)
+                      # (`5/15`: from 5 to the end, by 15.)
+                      [v, slash.empty? ? v : hi]
+                    end
+      raise ArgumentError.new("the #{what} range #{range} goes backwards") if first > last
+      v = first
+      while v <= last
+        out = out.add(v)
+        v += step
+      end
+    end
+    out
+  end
+
+  # :nodoc:
+  def self.value(text: String, lo: Int, hi: Int, what: String, names: Hash[String, Int]) -> Int
+    named = names[text.upcase]?
+    return named if named
+    raise ArgumentError.new("#{text.inspect} is not a #{what}") unless text.match?(/\A[0-9]{1,2}\z/)
+    v = text.to_i
+    raise ArgumentError.new("the #{what} #{v} is not within #{lo}-#{hi}") if v < lo || v > hi
+    v
+  end
+
+  MACROS = {"@yearly" => "0 0 1 1 *", "@annually" => "0 0 1 1 *", "@monthly" => "0 0 1 * *",
+            "@weekly" => "0 0 * * 0", "@daily" => "0 0 * * *", "@midnight" => "0 0 * * *", "@hourly" => "0 * * * *"}
+  NO_NAMES = Hash[String, Int].new
+  MONTHS = {"JAN" => 1, "FEB" => 2, "MAR" => 3, "APR" => 4, "MAY" => 5, "JUN" => 6,
+            "JUL" => 7, "AUG" => 8, "SEP" => 9, "OCT" => 10, "NOV" => 11, "DEC" => 12}
+  WDAYS = {"SUN" => 0, "MON" => 1, "TUE" => 2, "WED" => 3, "THU" => 4, "FRI" => 5, "SAT" => 6}
+
+  # A cron entry (`Cron.entry`).
+  data Entry = (expression: String, job: Type[Job], args: String, schedule: Schedule)
+
+  # The minutes, hours, days, months and days of the week an expression
+  # matches; `any_day`/`any_wday` when those fields started with `*`.
+  data Schedule(minutes: Set[Int], hours: Set[Int], days: Set[Int], months: Set[Int], wdays: Set[Int],
+                any_day: Bool, any_wday: Bool)
+    # Whether the minute of `t` (UTC) matches.
+    def match?(t: Time) -> Bool
+      return false unless minutes.include?(t.min) && hours.include?(t.hour) && months.include?(t.month)
+      day = days.include?(t.day)
+      wday = wdays.include?(t.wday)
+      # (Vixie cron: either field starred, both must match, `*/2` taken as
+      # its days; both restricted, either.)
+      any_day || any_wday ? day && wday : day || wday
+    end
+  end
+end

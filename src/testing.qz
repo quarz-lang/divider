@@ -1,0 +1,238 @@
+# Helpers for an application's tests: run jobs as they are enqueued
+# (`inline`), record enqueues without inserting (`fake`), or run what the
+# table holds (`drain`).
+#
+# ```quarz no_run
+# class Ping < Divider::Job
+#   def perform(job: Divider::Context) -> Void
+#     job.repo.exec("INSERT INTO pings DEFAULT VALUES")
+#   end
+# end
+#
+# class PingTest < Test::Case
+#   include Divider::Testing::Assertions
+#
+#   def repo -> Rotor::Repo = Rotor::Repo.new(pool: PG::Pool.new(ENV["DATABASE_URL"]))
+#
+#   def test_enqueued
+#     Divider::Testing.fake do
+#       Ping.enqueue(repo)
+#       assert_enqueued(Ping)
+#     end
+#   end
+#
+#   def test_run
+#     Divider::Testing.inline(repo) { Ping.enqueue(repo) }
+#     assert_equal(1, repo.query("SELECT count(*) FROM pings") { |r| r.int(0) }[0])
+#   end
+# end
+# ```
+#
+# Under `fake`, `unique` is not applied (each enqueue is recorded). Under
+# `inline`, a job enqueued `at:` or `after:` a time runs at once too, and a
+# unique enqueue that gives back a live job runs nothing.
+#
+# `inline` and `fake` set a mode for the whole process (Quarz has no
+# storage per task): they are not for tests run in parallel
+# (`quarz test --parallel`).
+module Testing
+  # An enqueue that `fake` recorded: the class's name, the queue, the
+  # arguments (JSON), the priority and the schedule given.
+  data Recorded = (class_name: String, queue: String, args: String, priority: Int, at: Time?, after: Duration?)
+
+  # :nodoc:
+  # The mode (`:off`, `:fake`, `:inline`), `fake`'s records, the jobs
+  # `inline` defers until their transaction is over, and the next fake id.
+  data State = (mode: Symbol, recorded: Array[Recorded], pending: Array[[Int, Type[Job]]], next_id: Int)
+
+  # :nodoc:
+  STATE = Atom[State].new(State.new(:off, Array[Recorded].new, Array[[Int, Type[Job]]].new, -1))
+
+  # Runs the block with enqueues recorded instead of inserted (each given
+  # an `Enqueued` with an id from -1 down, `available`, or `scheduled` at
+  # `at`); the records stay readable (`enqueued`) until the next `fake`.
+  def self.fake[R](&: () -> R) -> R
+    Testing.enter(:fake)
+    begin
+      yield
+    ensure
+      STATE.update { |s| s.with(mode: :off) }
+    end
+  end
+
+  # What `fake` recorded, of the class `job` (every class without it), in
+  # order.
+  def self.enqueued(job: Type[Job]? = nil) -> Array[Recorded]
+    all = STATE.get.recorded
+    job ? all.select { |r| r.class_name == job.name } : all
+  end
+
+  # Runs the block with each job enqueued run at once, in the calling task,
+  # over `repo`: one enqueued outside a transaction when it is enqueued,
+  # one enqueued inside a transaction at the next enqueue outside one, or
+  # when the block ends (a rolled-back one has no row, and does not run).
+  # Jobs run as a worker runs them (their outcome recorded in the row): a
+  # `Snooze` leaves the job scheduled, not run again.
+  def self.inline[R](repo: Rotor::Repo, &: () -> R) -> R
+    Testing.enter(:inline)
+    begin
+      yield
+    ensure
+      begin
+        # (Every transaction of the block is over: a job not found now
+        # was rolled back.)
+        Testing.run_pending(repo, true)
+      ensure
+        STATE.update { |s| s.with(mode: :off, pending: Array[[Int, Type[Job]]].new) }
+      end
+    end
+  end
+
+  # Runs, once, in the calling task, the jobs of the classes `jobs` due
+  # now in the table (not those they enqueue): how many ran.
+  def self.drain(repo: Rotor::Repo, *, jobs: Array[Type[Job]]) -> Int
+    by_name: Hash[String, Type[Job]] = {}
+    jobs.each { |j| by_name = by_name.put(j.name, j) }
+    ids = repo.query("SELECT id FROM divider_jobs WHERE state IN ('available', 'scheduled', 'failed') AND scheduled_at <= now() " +
+                     "AND cancelled_at IS NULL AND class IN (SELECT jsonb_array_elements_text($1::jsonb)) ORDER BY priority, scheduled_at, id",
+                     [JSON.generate(by_name.keys)]) { |r| r.int(0) }
+    ids.count { |id| Testing.run_one(repo, id, by_name) }
+  end
+
+  # The assertions of enqueued jobs, for a `Test::Case` that includes
+  # them.
+  module Assertions
+    include Test::Assertions
+
+    # Passes when `fake` recorded a job of the class `job` whose arguments
+    # include `args` (each equal as JSON; others ignored).
+    def assert_enqueued(job: Type[Job], **args: Object) -> Void
+      found = Testing.enqueued(job).any? { |r| Testing.args_match?(r.args, args) }
+      given = args.empty? ? "" : " with #{JSON.generate(args)}"
+      recorded = Testing.enqueued(job).map(&:args)
+      assert(found, "no #{job.name} enqueued#{given}; recorded: #{recorded.inspect}")
+    end
+
+    # Passes when `fake` recorded no job of the class `job` whose arguments
+    # include `args`.
+    def refute_enqueued(job: Type[Job], **args: Object) -> Void
+      found = Testing.enqueued(job).any? { |r| Testing.args_match?(r.args, args) }
+      assert(!found, "#{job.name} enqueued with #{JSON.generate(args)}")
+    end
+  end
+
+  # :nodoc:
+  def self.args_match?(stored: String, args: Hash[Symbol, Object]) -> Bool
+    have = JSON.parse(stored)
+    args.all? do |k, v|
+      got = have[k.to_s]?
+      !got.nil? && got == JSON.parse(JSON.generate([v]))[0]
+    end
+  end
+
+  # :nodoc:
+  def self.enter(mode: Symbol) -> Void
+    STATE.update do |s|
+      raise ArgumentError.new("Divider::Testing.#{mode} inside #{s.mode}") unless s.mode == :off
+      if mode == :fake
+        s.with(mode: mode, recorded: Array[Recorded].new, next_id: -1)
+      else
+        s.with(mode: mode, pending: Array[[Int, Type[Job]]].new)
+      end
+    end
+    nil
+  end
+
+  # :nodoc:
+  # In `fake`: `job` recorded, and its `Enqueued`; nil otherwise.
+  def self.faked(job: Queue::New) -> Enqueued?
+    id = 0
+    STATE.update do |st|
+      if st.mode == :fake
+        id = st.next_id
+        rec = Recorded.new(job.class_name, job.queue, job.args, job.priority, job.at, job.after)
+        st.with(recorded: st.recorded + [rec], next_id: st.next_id - 1)
+      else
+        id = 0
+        st
+      end
+    end
+    return nil if id == 0
+    now = Time.now
+    delay = job.after
+    due = job.at || (delay ? now + delay : now)
+    Enqueued.new(id, due > now ? :scheduled : :available, due)
+  end
+
+  # :nodoc:
+  # In `inline`: runs `e` (or defers it, inside a transaction).
+  def self.inserted(repo: Rotor::Repo, e: Enqueued, job: Queue::New) -> Void
+    cls = job.job
+    return if cls.nil?
+    queued = false
+    STATE.update do |s|
+      queued = s.mode == :inline
+      queued ? s.with(pending: s.pending + [[e.id, cls]]) : s
+    end
+    Testing.run_pending(repo, false) if queued && !repo.adapter.in_transaction?
+  end
+
+  # :nodoc:
+  # Runs the pending jobs. One not found is kept unless `final`: its
+  # transaction (on another connection) may not be over yet.
+  # The final pass goes on until nothing is pending (a job it runs may
+  # enqueue more, in a transaction).
+  def self.run_pending(repo: Rotor::Repo, final: Bool) -> Void
+    while true
+      taken = Testing.take_pending
+      return if taken.empty?
+      kept: Array[[Int, Type[Job]]] = []
+      i = 0
+      begin
+        while i < taken.size
+          entry = taken[i]
+          ran = Testing.run_one(repo, entry[0], {entry[1].name => entry[1]})
+          kept = kept + [entry] unless ran || final
+          i += 1
+        end
+      ensure
+        # (Kept, and those not reached when a run raised: pending again.)
+        rest = kept + taken[(i < taken.size ? i + 1 : i)...taken.size]
+        STATE.update { |s| s.with(pending: rest + s.pending) } unless rest.empty?
+      end
+      return unless final
+    end
+  end
+
+  # :nodoc:
+  # The pending jobs, taken out of the state.
+  def self.take_pending -> Array[[Int, Type[Job]]]
+    taken: Array[[Int, Type[Job]]] = []
+    STATE.update do |s|
+      taken = s.pending
+      s.with(pending: Array[[Int, Type[Job]]].new)
+    end
+    taken
+  end
+
+  # :nodoc:
+  # Runs the job `id` if it can be run now: whether it ran.
+  def self.run_one(repo: Rotor::Repo, id: Int, jobs: Hash[String, Type[Job]]) -> Bool
+    rows = repo.query(CLAIM, [id, NODE]) do |r|
+      Fetched.new(r.int(0), r.string(1), r.string(2), r.string(3), r.int(4), r.int(5), r.time(6), r.time(7))
+    end
+    row = rows.first?
+    return false if row.nil?
+    runner = Runner.new(repo, jobs, NODE, 1, nil, nil)
+    runner.record(row, runner.run_attempt(row))
+    true
+  end
+
+  # :nodoc:
+  NODE = "divider-testing"
+
+  # :nodoc:
+  CLAIM = "UPDATE divider_jobs SET state = 'running', node = $2, locked_at = now(), attempt = attempt + 1 " +
+          "WHERE id = $1 AND state IN ('available', 'scheduled', 'failed') AND cancelled_at IS NULL " +
+          "RETURNING id, class, queue, args::text, attempt, max_attempts, inserted_at, scheduled_at"
+end
