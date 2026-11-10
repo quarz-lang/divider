@@ -32,6 +32,10 @@ it is set (CI's `postgres:16` service sets it), else a throwaway
 cluster. `PG_TEST_URL`'s server is shared and kept between runs: a test
 drops what it creates, before and after.
 
+Long commands and waits (tests, builds, CI): follow the `long-jobs`
+skill (run them with `run_in_background`, keep the log and `exit=$?`,
+never use `pgrep -f` with a plain pattern).
+
 - Work on a branch and open a pull request (below); stage files by explicit path.
 - Review the branch's diff with a fresh subagent before the pull request
   leaves draft (commits on a draft are fine without it), and fix what it
