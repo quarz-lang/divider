@@ -57,7 +57,7 @@ class Cron
   def tick(repo: Rotor::Repo, minute: Time) -> Int
     n = 0
     due(minute).each do |e|
-      key = Digest::SHA256.hexdigest("#{e.expression}\n#{e.job.name}\n#{e.args}")
+      key = Cron.key(e)
       repo.transaction do |tx|
         won = tx.query(CLAIM, [key, minute]) { |r| r.string(0) }
         unless won.empty?
@@ -70,6 +70,24 @@ class Cron
     end
     n
   end
+
+  # :nodoc:
+  # The key of `entry`'s row in `divider_cron`: a digest of its expression,
+  # job class and arguments.
+  def self.key(e: Entry) -> String = Digest::SHA256.hexdigest("#{e.expression}\n#{e.job.name}\n#{e.args}")
+
+  # :nodoc:
+  # The keys of the entries' rows.
+  def keys -> Array[String] = @entries.map { |e| Cron.key(e) }
+
+  # How long a row of `divider_cron` stays when none of a worker's entries
+  # names it, by its last minute. The row only keeps the workers that check
+  # the same minute from enqueueing twice, so it matters for a minute or
+  # so; but another worker's schedule may still name it, and one due once a
+  # year (`@yearly`) has a row a year old while in use, so the bound is more
+  # than a year. A pruned row of an entry that is due again is inserted
+  # anew and enqueues, as for any new entry.
+  ROW_KEEP = 400.days
 
   # (One row per entry: the last minute it was enqueued for. Only the
   # worker that moves it forward enqueues.)

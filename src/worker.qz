@@ -383,6 +383,9 @@ class Worker
           Fetched.new(r.int(0), r.string(1), r.string(2), "{}", r.int(3), r.int(4), r.time(5), r.time(6))
         end
         tx.exec(PRUNE, [@keep_completed.to_ms, @keep_discarded.to_ms])
+        # (Entries removed from the schedule or changed leave their rows.)
+        cron = @cron
+        tx.exec(PRUNE_CRON, [Cron::ROW_KEEP.to_ms, JSON.generate(cron ? cron.keys : [])])
       end
       nil
     end
@@ -475,6 +478,11 @@ class Worker
            "'message', 'its node (' || COALESCE(node, '?') || ') stopped beating', 'backtrace', '[]'::jsonb)) " +
            "WHERE state = 'running' AND locked_at < now() - $1::bigint * interval '1 millisecond' " +
            "RETURNING id, class, queue, attempt, max_attempts, inserted_at, scheduled_at"
+
+  # The rows of `divider_cron` older than `Cron::ROW_KEEP` that none of this
+  # worker's entries names.
+  PRUNE_CRON = "DELETE FROM divider_cron WHERE last_minute < now() - $1::bigint * interval '1 millisecond' " +
+               "AND key NOT IN (SELECT jsonb_array_elements_text($2::jsonb))"
 
   PRUNE = "DELETE FROM divider_jobs WHERE (state = 'completed' AND completed_at < now() - $1::bigint * interval '1 millisecond') " +
           "OR (state = 'discarded' AND discarded_at < now() - $2::bigint * interval '1 millisecond') " +

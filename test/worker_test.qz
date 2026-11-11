@@ -137,13 +137,14 @@ class WorkerTest < Test::Case
   end
 
   def worker(url: String, *, queues: Hash[Symbol, Int] = {default: 3}, poll: Duration = 100.ms, node: String = "test-node",
-             events: Channel[Divider::Event]? = nil, heartbeat: Duration = 30.seconds, stale_after: Duration = 5.minutes) -> Divider::Worker
+             events: Channel[Divider::Event]? = nil, heartbeat: Duration = 30.seconds, stale_after: Duration = 5.minutes,
+             cron: Divider::Cron? = nil) -> Divider::Worker
     if (ch = events)
-      Divider::Worker.new(url, jobs: ALL, queues: queues, poll: poll, node: node, heartbeat: heartbeat, stale_after: stale_after,
+      Divider::Worker.new(url, jobs: ALL, queues: queues, poll: poll, node: node, heartbeat: heartbeat, stale_after: stale_after, cron: cron,
                           on_error: ->(e: Exception, c: Divider::Context) { nil },
                           on_event: ->(ev: Divider::Event) { ch.try_send(ev); nil })
     else
-      Divider::Worker.new(url, jobs: ALL, queues: queues, poll: poll, node: node, heartbeat: heartbeat, stale_after: stale_after,
+      Divider::Worker.new(url, jobs: ALL, queues: queues, poll: poll, node: node, heartbeat: heartbeat, stale_after: stale_after, cron: cron,
                           on_error: ->(e: Exception, c: Divider::Context) { nil })
     end
   end
@@ -518,6 +519,28 @@ class WorkerTest < Test::Case
       # (The worker never ran: shut it down to close its pool.)
       w.shutdown
       w.run
+    end
+  end
+
+  def test_maintenance_prunes_stale_cron_rows
+    with_repo do |repo, url|
+      entry = Divider::Cron.entry("*/5 * * * *", WtCount)
+      named = Divider::Cron.key(entry)
+      repo.exec("INSERT INTO divider_cron (key, last_minute) VALUES ($1, now() - interval '500 days'), ($2, now() - interval '500 days'), " +
+                "($3, now() - interval '399 days'), ($4, now() - interval '1 day')", [named, "old-unnamed", "within-bound", "recent"])
+      w = worker(url, cron: Divider::Cron.new([entry]))
+      w.maintain_once(repo)
+      keys = repo.query("SELECT key FROM divider_cron ORDER BY key") { |r| r.string(0) }
+      # An old row an entry names stays; old and unnamed goes; the others stay.
+      assert_equal([named, "recent", "within-bound"].sort, keys)
+      # Without a schedule, every old row goes.
+      w2 = worker(url)
+      w2.maintain_once(repo)
+      assert_equal(["recent", "within-bound"], repo.query("SELECT key FROM divider_cron ORDER BY key") { |r| r.string(0) })
+      w.shutdown
+      w.run
+      w2.shutdown
+      w2.run
     end
   end
 
