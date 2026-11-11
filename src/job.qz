@@ -20,7 +20,7 @@
 # `enqueue` runs in the repository's transaction when it is bound to
 # one (`repo.transaction { |tx| ... Cleanup.enqueue(tx) }`): the job
 # exists, and a worker hears of it, only once that commits.
-class Job
+abstract class Job
   # Runs the job: what a job without `job_args` defines, with what the worker
   # tells of the attempt (`job.repo` for its queries). Returning ends the
   # job `completed`; `Divider::Discard` discards it, `Divider::Snooze`
