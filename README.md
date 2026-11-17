@@ -92,7 +92,9 @@ end
   it; `Divider::Snooze.new(10.minutes)` puts it off without counting the
   attempt; any other exception, or the `timeout`, fails the attempt,
   recorded in the row's `errors` and retried after `attempt ** 4 + 15`
-  seconds plus up to 30 (as Oban), until `max_attempts`, then discarded.
+  seconds plus up to 30 (or what the job's `def self.retry_in(attempt:
+  Int, error: Exception) -> Duration` says), until `max_attempts`, then
+  discarded.
 - `Divider.cancel` cancels a scheduled, available or failed job; a running
   one is asked to stop: it sees `job.cancel_requested?` and raises
   `Divider::Cancelled` (the job ends `cancelled`), or finishes anyway

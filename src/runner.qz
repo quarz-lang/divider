@@ -73,9 +73,21 @@ class Runner
       if row.attempt >= row.max_attempts
         Outcome.new(Worker::FINISH_DISCARDED, err, nil, :discarded, ms, e.message)
       else
-        Outcome.new(Worker::FINISH_FAILED, err, Worker.backoff(row.attempt), :failed, ms, e.message)
+        Outcome.new(Worker::FINISH_FAILED, err, retry_ms(row, e), :failed, ms, e.message)
       end
     end
+  end
+
+  # :nodoc:
+  # The delay before the next attempt, in milliseconds: the job's
+  # `retry_in`, 0 for a negative one; `Worker.backoff` when the hook
+  # raises (said on standard error).
+  def retry_ms(row: Fetched, e: Exception) -> Int
+    ms = @jobs[row.class_name].retry_in(row.attempt, e).to_ms
+    ms < 0 ? 0 : ms
+  rescue StandardError => h
+    STDERR.puts "divider: #{row.class_name}.retry_in raised (#{h.class.name}: #{h.message}); the default delay is used"
+    Worker.backoff(row.attempt)
   end
 
   # :nodoc:
