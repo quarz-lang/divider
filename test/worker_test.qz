@@ -102,6 +102,40 @@ class WtSnoozeNow < Divider::Job
   end
 end
 
+# Delays by attempt and error: 1000 seconds after the first attempt's
+# "retry 1", 2000 after the second's.
+class WtRetry < Divider::Job
+  max_attempts 3
+
+  def self.retry_in(attempt: Int, error: Exception) -> Duration
+    error.message == "retry #{attempt}" ? (attempt * 1000).seconds : 1.second
+  end
+
+  def perform(job: Divider::Context) -> Void
+    raise ArgumentError.new("retry #{job.attempt}")
+  end
+end
+
+class WtRetryNegative < Divider::Job
+  max_attempts 2
+
+  def self.retry_in(attempt: Int, error: Exception) -> Duration = -5.seconds
+
+  def perform(job: Divider::Context) -> Void
+    raise ArgumentError.new("negative")
+  end
+end
+
+class WtRetryRaises < Divider::Job
+  def self.retry_in(attempt: Int, error: Exception) -> Duration
+    raise ArgumentError.new("no delay")
+  end
+
+  def perform(job: Divider::Context) -> Void
+    raise ArgumentError.new("raises")
+  end
+end
+
 class WtQuick < Divider::Job
   def perform(job: Divider::Context) -> Void
     Task.sleep(5.ms)
@@ -112,7 +146,7 @@ end
 # with two workers, the notification, failures and retries, Discard,
 # Snooze, timeouts, cancellation, shutdown, rescue and pruning.
 class WorkerTest < Test::Case
-  ALL = [WtCount, WtFail, WtDiscard, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo, WtArgsError, WtQuick, WtSnoozeNow]
+  ALL = [WtCount, WtFail, WtDiscard, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo, WtArgsError, WtQuick, WtSnoozeNow, WtRetry, WtRetryNegative, WtRetryRaises]
 
   def with_repo(&: (Rotor::Repo, String) -> Void) -> Void
     PG::Testing.with_cluster do |url|
@@ -241,14 +275,22 @@ class WorkerTest < Test::Case
     end
   end
 
+  # The delay the failure `nth` (0 the first, -1 the last) gave, in
+  # milliseconds: from its time (recorded with the schedule, in one
+  # statement) to the next run, the schedule since unchanged.
+  def retry_delay(repo: Rotor::Repo, id: Int, nth: Int = -1) -> Int
+    sql = "SELECT round(extract(epoch FROM scheduled_at - (errors->#{nth}->>'at')::timestamptz) * 1000)::bigint FROM divider_jobs WHERE id = $1"
+    repo.query(sql, [id]) { |r| r.int(0) }[0]
+  end
+
   def test_failures_retry_with_backoff_then_discard
     with_repo do |repo, url|
       job = WtFail.enqueue(repo)
       run_until(worker(url)) { state(repo, job.id) == "failed" }
       assert_equal("failed", state(repo, job.id))
-      # The next attempt in 1 ** 4 + 15 + 0..30 seconds.
-      delay = repo.query("SELECT extract(epoch FROM scheduled_at - now())::int FROM divider_jobs WHERE id = $1", [job.id]) { |r| r.int(0) }[0]
-      assert_true(delay >= 14 && delay <= 46, "delay #{delay}")
+      # The default: the next attempt in 1 ** 4 + 15 + 0..30 seconds.
+      delay = retry_delay(repo, job.id)
+      assert_true(delay >= 16_000 && delay <= 46_000 && delay % 1000 == 0, "delay #{delay}")
       err = repo.query("SELECT errors->0->>'error', errors->0->>'message', (errors->0->>'attempt')::int FROM divider_jobs WHERE id = $1", [job.id]) do |r|
         "#{r.string(0)} #{r.string(1)} #{r.int(2)}"
       end
@@ -259,6 +301,49 @@ class WorkerTest < Test::Case
       assert_equal("discarded", state(repo, job.id))
       assert_equal(2, count(repo, "SELECT jsonb_array_length(errors) FROM divider_jobs"))
       assert_equal(2, count(repo, "SELECT attempt FROM divider_jobs"))
+    end
+  end
+
+  def test_a_job_s_own_retry_delays
+    with_repo do |repo, url|
+      job = WtRetry.enqueue(repo)
+      negative = WtRetryNegative.enqueue(repo)
+      run_until(worker(url)) { state(repo, job.id) == "failed" && state(repo, negative.id) == "discarded" }
+      # The hook's delay, given the attempt and its error.
+      assert_equal(["failed", 1_000_000], [state(repo, job.id), retry_delay(repo, job.id)])
+      repo.exec("UPDATE divider_jobs SET scheduled_at = now() WHERE id = $1", [job.id])
+      run_until(worker(url)) { count(repo, "SELECT attempt FROM divider_jobs WHERE id = #{job.id}") == 2 && state(repo, job.id) == "failed" }
+      assert_equal(["failed", 2_000_000], [state(repo, job.id), retry_delay(repo, job.id)])
+      # Each attempt counts and records its error; the last discards.
+      repo.exec("UPDATE divider_jobs SET scheduled_at = now() WHERE id = $1", [job.id])
+      run_until(worker(url)) { state(repo, job.id) == "discarded" }
+      assert_equal("discarded", state(repo, job.id))
+      messages = repo.query("SELECT e->>'message' FROM divider_jobs, jsonb_array_elements(errors) e WHERE id = $1", [job.id]) { |r| r.string(0) }
+      assert_equal(["retry 1", "retry 2", "retry 3"], messages)
+      # A negative delay counts as zero: run again at once (the second,
+      # last attempt discards it, leaving the schedule).
+      assert_equal("discarded", state(repo, negative.id))
+      assert_equal(0, retry_delay(repo, negative.id, 0))
+    end
+  end
+
+  # A hook that raises: the default delay, and `on_error` is told of the
+  # job's error, then of the hook's, each with the attempt's context.
+  def test_a_retry_hook_that_raises
+    with_repo do |repo, url|
+      job = WtRetryRaises.enqueue(repo)
+      errors = Channel[String].new(10)
+      w = Divider::Worker.new(url, jobs: ALL, poll: 100.ms, node: "test-node",
+                              on_error: ->(e: Exception, c: Divider::Context) { errors.try_send("#{e.message} (#{c.class_name} #{c.id} #{c.attempt})"); nil })
+      run_until(w) { state(repo, job.id) == "failed" }
+      assert_equal("failed", state(repo, job.id))
+      delay = retry_delay(repo, job.id)
+      assert_true(delay >= 16_000 && delay <= 46_000, "delay #{delay}")
+      got: Array[String] = []
+      while (m = errors.try_receive)
+        got = got.push(m)
+      end
+      assert_equal(["raises (WtRetryRaises #{job.id} 1)", "no delay (WtRetryRaises #{job.id} 1)"], got)
     end
   end
 
