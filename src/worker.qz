@@ -321,15 +321,18 @@ class Worker
 
   # :nodoc:
   # The cron entries: every `CRON_CHECK`, until `done` is closed, those
-  # due at the database's current minute.
+  # due at the database's current minute, and at the first check that
+  # goes through, those to run on start.
   def schedule(done: Channel[Nil]) -> Void
     cron = @cron
     return if cron.nil?
     repo = Rotor::Repo.new(pool: @pool)
+    starting = true
     while true
       begin
         minute = repo.query("SELECT date_trunc('minute', now())") { |r| r.time(0) }[0]
-        cron.tick(repo, minute)
+        cron.tick(repo, minute, starting)
+        starting = false
       rescue StandardError => e
         STDERR.puts "divider: enqueueing the cron entries failed: #{e.class.name}: #{e.message}"
       end

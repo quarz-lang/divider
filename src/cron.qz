@@ -22,7 +22,10 @@
 #
 # A worker checks every 15 seconds, by the database's clock, and enqueues
 # each entry once per due minute however many workers check: a minute no
-# worker checked (all of them stopped) is not made up afterwards.
+# worker checked (all of them stopped) is not made up afterwards. An
+# entry made with `run_on_start: true` is also enqueued at a worker's
+# first check, due or not: once for that minute however many workers
+# start in it, then on its schedule.
 class Cron
   include Shareable
 
@@ -37,12 +40,16 @@ class Cron
 
   # An entry: `job` enqueued, with `args` (its arguments as keywords,
   # JSON-encoded now; checked when the job is decoded), at each minute
-  # `expression` matches. `ArgumentError` for an expression that does not
-  # parse.
-  def self.entry(expression: String, job: Type[Job], **args: Object) -> Entry
+  # `expression` matches, and with `run_on_start`, also at a worker's
+  # first check. `ArgumentError` for an expression that does not parse.
+  #
+  # ```quarz no_run
+  # Divider::Cron.entry("0 * * * *", Divider::Job, run_on_start: true)
+  # ```
+  def self.entry(expression: String, job: Type[Job], *, run_on_start: Bool = false, **args: Object) -> Entry
     values: Hash[String, Object] = {}
     args.each_pair { |k, v| values = values.put(k.to_s, v) }
-    Entry.new(expression, job, JSON.generate(values), Cron.parse(expression))
+    Entry.new(expression, job, JSON.generate(values), Cron.parse(expression), run_on_start)
   end
 
   # The entries due at the minute of `at` (UTC; seconds ignored).
@@ -52,11 +59,13 @@ class Cron
   end
 
   # :nodoc:
-  # Enqueues the entries due at the minute `minute` that no worker has
-  # enqueued for it yet; how many it enqueued.
-  def tick(repo: Rotor::Repo, minute: Time) -> Int
+  # Enqueues the entries due at the minute `minute`, and with `starting`
+  # (a worker's first check) those made with `run_on_start`, that no
+  # worker has enqueued for that minute yet; how many it enqueued.
+  def tick(repo: Rotor::Repo, minute: Time, starting: Bool = false) -> Int
     n = 0
-    due(minute).each do |e|
+    t = minute.utc
+    @entries.select { |e| e.schedule.match?(t) || (starting && e.run_on_start) }.each do |e|
       key = Cron.key(e)
       repo.transaction do |tx|
         won = tx.query(CLAIM, [key, minute]) { |r| r.string(0) }
@@ -164,7 +173,7 @@ class Cron
   WDAYS = {"SUN" => 0, "MON" => 1, "TUE" => 2, "WED" => 3, "THU" => 4, "FRI" => 5, "SAT" => 6}
 
   # A cron entry (`Cron.entry`).
-  data Entry = (expression: String, job: Type[Job], args: String, schedule: Schedule)
+  data Entry = (expression: String, job: Type[Job], args: String, schedule: Schedule, run_on_start: Bool = false)
 
   # The minutes, hours, days, months and days of the week an expression
   # matches; `any_day`/`any_wday` when those fields started with `*`.
