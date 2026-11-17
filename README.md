@@ -149,6 +149,11 @@ of their queue runs them). **A minute no
 worker checked (every worker stopped) is not made up afterwards.** An
 entry's arguments are keywords, encoded when the entry is made and
 checked when the job is decoded.
+`Divider::Cron.entry("0 * * * *", Cleanup, run_on_start: true)` also
+enqueues the entry at a worker's first check, due or not: once for that
+minute however many workers start in it (a worker starting in a later
+minute enqueues it again; with `unique`, a live one is not doubled),
+then on its schedule.
 
 ## Testing
 

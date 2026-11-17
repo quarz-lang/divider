@@ -10,6 +10,11 @@ class CtCount < Divider::Job
   end
 end
 
+class CtOnce < Divider::Job
+  queue :cron
+  unique
+end
+
 # Cron expressions, what is due when, and the ticks against a server:
 # one job per entry and minute, however many workers tick.
 class CronTest < Test::Case
@@ -118,6 +123,70 @@ class CronTest < Test::Case
       # An earlier minute (a slow worker's tick) is not enqueued again.
       assert_equal(0, cron.tick(repo, three))
       assert_equal(3, jobs(repo).size)
+    end
+  end
+
+  def test_run_on_start
+    with_repo do |repo, _|
+      yearly = Divider::Cron.entry("0 0 1 1 *", CtTick, run_on_start: true)
+      plain = Divider::Cron.entry("0 0 1 1 *", CtTick, scope: "plain")
+      assert_true(yearly.run_on_start)
+      assert_false(plain.run_on_start)
+      cron = Divider::Cron.new([yearly, plain])
+      other = Divider::Cron.new(cron.entries)
+      ten = Time.utc(2026, 11, 8, 10, 0)
+      # Not due: a check that is not a start enqueues nothing.
+      assert_equal(0, cron.tick(repo, ten))
+      # Two workers starting in one minute: one enqueues, only the
+      # entry made with `run_on_start`.
+      assert_equal(1, cron.tick(repo, ten, true))
+      assert_equal(0, other.tick(repo, ten, true))
+      assert_equal(["CtTick cron {}"], jobs(repo))
+      # A worker starting in a later minute enqueues it again.
+      assert_equal(1, other.tick(repo, Time.utc(2026, 11, 8, 10, 1), true))
+      # Due and starting in the same minute: once.
+      jan = Time.utc(2027, 1, 1, 0, 0)
+      assert_equal(2, cron.tick(repo, jan, true))
+      assert_equal(0, other.tick(repo, jan, true))
+      assert_equal(4, jobs(repo).size)
+    end
+  end
+
+  def test_run_on_start_with_unique
+    with_repo do |repo, _|
+      CtOnce.enqueue(repo)
+      cron = Divider::Cron.new([Divider::Cron.entry("0 0 1 1 *", CtOnce, run_on_start: true)])
+      cron.tick(repo, Time.utc(2026, 11, 8, 10, 0), true)
+      # The live one is not doubled.
+      assert_equal(["CtOnce cron {}"], jobs(repo))
+    end
+  end
+
+  def test_two_starting_workers_enqueue_once
+    with_repo do |repo, url|
+      # (Both first checks in one minute: start early in a minute.)
+      second = repo.query("SELECT extract(second FROM now())::int") { |r| r.int(0) }[0]
+      Task.sleep((61 - second).seconds) if second >= 40
+      cron = Divider::Cron.new([Divider::Cron.entry("0 0 1 1 *", CtCount, run_on_start: true)])
+      a = Divider::Worker.new(url, jobs: [CtCount], poll: 50.ms, node: "ct-a", cron: cron)
+      b = Divider::Worker.new(url, jobs: [CtCount], poll: 50.ms, node: "ct-b", cron: cron)
+      ta = Task.spawn { a.run }
+      tb = Task.spawn { b.run }
+      begin
+        200.times do
+          break if repo.query("SELECT count(*) FROM ct_runs") { |r| r.int(0) }[0] >= 1
+          Task.sleep(50.ms)
+        end
+        # (Time for the other worker's first check, and a run of a second
+        # job if it had enqueued one.)
+        Task.sleep(1.second)
+      ensure
+        a.shutdown
+        b.shutdown
+        ta.await
+        tb.await
+      end
+      assert_equal(1, repo.query("SELECT count(*) FROM ct_runs") { |r| r.int(0) }[0])
     end
   end
 
