@@ -308,10 +308,7 @@ class WorkerTest < Test::Case
     with_repo do |repo, url|
       job = WtRetry.enqueue(repo)
       negative = WtRetryNegative.enqueue(repo)
-      raises = WtRetryRaises.enqueue(repo)
-      run_until(worker(url)) do
-        state(repo, job.id) == "failed" && state(repo, negative.id) == "discarded" && state(repo, raises.id) == "failed"
-      end
+      run_until(worker(url)) { state(repo, job.id) == "failed" && state(repo, negative.id) == "discarded" }
       # The hook's delay, given the attempt and its error.
       assert_equal(["failed", 1_000_000], [state(repo, job.id), retry_delay(repo, job.id)])
       repo.exec("UPDATE divider_jobs SET scheduled_at = now() WHERE id = $1", [job.id])
@@ -324,12 +321,29 @@ class WorkerTest < Test::Case
       messages = repo.query("SELECT e->>'message' FROM divider_jobs, jsonb_array_elements(errors) e WHERE id = $1", [job.id]) { |r| r.string(0) }
       assert_equal(["retry 1", "retry 2", "retry 3"], messages)
       # A negative delay counts as zero: run again at once (the second,
-      # last attempt discards it, leaving the schedule); a hook that
-      # raises gives the default.
+      # last attempt discards it, leaving the schedule).
       assert_equal("discarded", state(repo, negative.id))
       assert_equal(0, retry_delay(repo, negative.id, 0))
-      delay = retry_delay(repo, raises.id)
+    end
+  end
+
+  # A hook that raises: the default delay, and `on_error` is told of the
+  # job's error, then of the hook's, each with the attempt's context.
+  def test_a_retry_hook_that_raises
+    with_repo do |repo, url|
+      job = WtRetryRaises.enqueue(repo)
+      errors = Channel[String].new(10)
+      w = Divider::Worker.new(url, jobs: ALL, poll: 100.ms, node: "test-node",
+                              on_error: ->(e: Exception, c: Divider::Context) { errors.try_send("#{e.message} (#{c.class_name} #{c.id} #{c.attempt})"); nil })
+      run_until(w) { state(repo, job.id) == "failed" }
+      assert_equal("failed", state(repo, job.id))
+      delay = retry_delay(repo, job.id)
       assert_true(delay >= 16_000 && delay <= 46_000, "delay #{delay}")
+      got: Array[String] = []
+      while (m = errors.try_receive)
+        got = got.push(m)
+      end
+      assert_equal(["raises (WtRetryRaises #{job.id} 1)", "no delay (WtRetryRaises #{job.id} 1)"], got)
     end
   end
 

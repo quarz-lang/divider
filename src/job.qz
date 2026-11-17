@@ -68,9 +68,10 @@ abstract class Job
   #
   # The attempt still counts toward `max_attempts`, and its error is
   # recorded. A negative delay counts as zero. If the hook raises, the
-  # default delay is used and the hook's error is written to standard
-  # error. The worker calls it as soon as the attempt fails, so it
-  # should return at once.
+  # default delay is used, and the hook's error is written to standard
+  # error and given to the worker's `on_error` (with the attempt's
+  # context, after the job's own error). The worker calls it as soon as
+  # the attempt fails, so it should return at once.
   def self.retry_in(attempt: Int, error: Exception) -> Duration = Worker.backoff(attempt).ms
 
   # The job's queue: a name of letters, digits and `_` (at compile
