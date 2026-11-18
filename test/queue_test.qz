@@ -17,6 +17,22 @@ class QtHourly < Divider::Job
   unique period: 1.hour
 end
 
+class QtBatch < Divider::Job
+  queue :mail
+  data Args = (n: Int)
+  job_args Args
+  def perform(args: Args, job: Divider::Context) -> Void
+  end
+end
+
+class QtBatchOnce < Divider::Job
+  data Args = (n: Int, tag: String)
+  job_args Args
+  unique by: [:n]
+  def perform(args: Args, job: Divider::Context) -> Void
+  end
+end
+
 # The schema, enqueue (scheduling, priority, the notification at commit,
 # uniqueness) and cancel, against a server (`PG::Testing`).
 class QueueTest < Test::Case
@@ -178,6 +194,104 @@ class QueueTest < Test::Case
       # A key differs by class.
       other = Divider::Queue.insert(repo, Divider::Queue::New.new("QtOther", "default", "{\"user_id\": 1}", 5, nil, nil, 20, u))
       assert_false(other.id == a.id)
+    end
+  end
+
+  # The `n` of each job's stored arguments.
+  def ns(repo: Rotor::Repo, jobs: Array[Divider::Enqueued]) -> Array[Int]
+    jobs.map { |e| repo.query("SELECT (args->>'n')::int FROM divider_jobs WHERE id = $1", [e.id]) { |r| r.int(0) }[0] }
+  end
+
+  def test_enqueue_all
+    with_repo do |repo, url|
+      # In the order given, whatever the values.
+      jobs = QtBatch.enqueue_all(repo: repo, args: [4, 0, 3, 1, 2].map { |n| QtBatch::Args.new(n) })
+      assert_equal([4, 0, 3, 1, 2], ns(repo, jobs))
+      assert_equal(5, jobs.map(&:id).uniq.size)
+      assert_equal([:available], jobs.map(&:state).uniq)
+      assert_equal([["QtBatch", "mail", 5, 20]],
+                   repo.query("SELECT DISTINCT class, queue, priority, max_attempts FROM divider_jobs") { |r| [r.string(0), r.string(1), r.int(2), r.int(3)] })
+      # The scheduling, the same for all.
+      later = QtBatch.enqueue_all(repo: repo, args: [QtBatch::Args.new(7), QtBatch::Args.new(8)], after: 1.hour, priority: 1)
+      assert_equal([:scheduled, :scheduled], later.map(&:state))
+      assert_equal([1], repo.query("SELECT DISTINCT priority FROM divider_jobs WHERE id = ANY($1::bigint[])", [later.map(&:id)]) { |r| r.int(0) })
+      # Nothing for an empty array.
+      none: Array[QtBatch::Args] = []
+      assert_equal(0, QtBatch.enqueue_all(repo: repo, args: none).size)
+      assert_equal(7, count(repo))
+      # What enqueue refuses, and what is no array of the arguments.
+      assert_raise(ArgumentError) { QtBatch.enqueue_all(repo: repo, args: [QtBatch::Args.new(1)], at: Time.now, after: 1.second) }
+      assert_raise(ArgumentError) { QtBatch.enqueue_all(repo: repo, args: [QtBatch::Args.new(1)], priority: 10) }
+      assert_raise(ArgumentError) { QtBatch.enqueue_all(repo: repo, args: [QtBatchOnce::Args.new(1, "x")]) }
+      assert_raise(ArgumentError) { QtBatch.enqueue_all(repo: repo, args: QtBatch::Args.new(1)) }
+      assert_equal(7, count(repo))
+    end
+  end
+
+  def test_enqueue_all_unique
+    with_repo do |repo, url|
+      live = QtBatchOnce.enqueue(repo: repo, n: 2, tag: "before")
+      jobs = QtBatchOnce.enqueue_all(repo: repo, args: [QtBatchOnce::Args.new(1, "a"), QtBatchOnce::Args.new(2, "b"),
+                                                        QtBatchOnce::Args.new(5, "c"), QtBatchOnce::Args.new(5, "d"),
+                                                        QtBatchOnce::Args.new(2, "e")])
+      # A live job's key: that job; a key twice in the call: the first.
+      assert_equal(live.id, jobs[1].id)
+      assert_equal(live.id, jobs[4].id)
+      assert_equal(jobs[2].id, jobs[3].id)
+      assert_false(jobs[0].id == jobs[2].id)
+      assert_equal(3, count(repo))
+      assert_equal(["before", "a", "c"],
+                   repo.query("SELECT args->>'tag' FROM divider_jobs ORDER BY id") { |r| r.string(0) })
+      # Ended: a new job for its key.
+      repo.exec("UPDATE divider_jobs SET state = 'completed' WHERE id = $1", [live.id])
+      again = QtBatchOnce.enqueue_all(repo: repo, args: [QtBatchOnce::Args.new(2, "f")])
+      assert_false(again[0].id == live.id)
+      assert_equal(4, count(repo))
+    end
+  end
+
+  # Equal arguments without `unique`: a job each. A role with only the
+  # tables' privileges (no USAGE on the id's sequence) can enqueue_all.
+  def test_enqueue_all_equal_args_and_table_privileges
+    with_repo do |repo, url|
+      jobs = QtBatch.enqueue_all(repo: repo, args: [QtBatch::Args.new(1), QtBatch::Args.new(1), QtBatch::Args.new(2)])
+      assert_equal(3, jobs.map(&:id).uniq.size)
+      assert_equal([1, 1, 2], ns(repo, jobs))
+      repo.exec("DROP ROLE IF EXISTS divider_qt_app")
+      repo.exec("CREATE ROLE divider_qt_app LOGIN PASSWORD 'qt-pass'")
+      begin
+        repo.exec("GRANT SELECT, INSERT, UPDATE, DELETE ON divider_jobs TO divider_qt_app")
+        PG::Pool.open(url.sub(/\/\/[^@]*@/, "//divider_qt_app:qt-pass@"), 1) do |pool|
+          app = Rotor::Repo.new(pool: pool)
+          assert_equal(2, QtBatch.enqueue_all(repo: app, args: [QtBatch::Args.new(5), QtBatch::Args.new(6)]).size)
+          assert_equal(2, QtBatchOnce.enqueue_all(repo: app, args: [QtBatchOnce::Args.new(5, "a"), QtBatchOnce::Args.new(5, "b")]).map(&:id).uniq.size == 1 ? 2 : 0)
+          nil
+        end
+      ensure
+        repo.exec("REVOKE ALL ON divider_jobs FROM divider_qt_app")
+        repo.exec("DROP ROLE divider_qt_app")
+      end
+    end
+  end
+
+  def test_enqueue_all_notifies_once
+    with_repo do |repo, url|
+      listener = PG.connect(url)
+      begin
+        listener.listen("divider")
+        repo.transaction do |tx|
+          QtBatch.enqueue_all(repo: tx, args: (1..50).map { |n| QtBatch::Args.new(n) })
+          nil
+        end
+        n = listener.wait_for_notify(timeout: 5.seconds)
+        assert_equal("mail", n&.payload)
+        assert_nil(listener.wait_for_notify(timeout: 200.ms))
+        # All scheduled: none.
+        QtBatch.enqueue_all(repo: repo, args: [QtBatch::Args.new(1)], after: 1.hour)
+        assert_nil(listener.wait_for_notify(timeout: 200.ms))
+      ensure
+        listener.close
+      end
     end
   end
 

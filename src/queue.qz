@@ -16,11 +16,7 @@ module Queue
   # commit) when it is due now. With `unique`, a live job of the same key
   # is given instead, and nothing is inserted.
   def self.insert(repo: Rotor::Repo, job: New) -> Enqueued
-    raise ArgumentError.new("enqueue takes at: or after:, not both") if job.at && job.after
-    p = job.priority
-    raise ArgumentError.new("a priority is 0 to 9, not #{p}") if p < 0 || p > 9
-    delay = job.after
-    raise ArgumentError.new("after: is not negative, not #{delay}") if delay && delay.to_ms < 0
+    Queue.check(job)
     # (`Divider::Testing`: recorded instead, or run once inserted.)
     if (faked = Testing.faked(job))
       return faked
@@ -28,6 +24,17 @@ module Queue
     e, inserted = Queue.insert_row(repo, job)
     Testing.inserted(repo, e, job) if inserted
     e
+  end
+
+  # Raises `ArgumentError` for scheduling `enqueue` refuses: both `at`
+  # and `after`, a priority outside 0 to 9, a negative `after`.
+  def self.check(job: New) -> Void
+    raise ArgumentError.new("enqueue takes at: or after:, not both") if job.at && job.after
+    p = job.priority
+    raise ArgumentError.new("a priority is 0 to 9, not #{p}") if p < 0 || p > 9
+    delay = job.after
+    raise ArgumentError.new("after: is not negative, not #{delay}") if delay && delay.to_ms < 0
+    nil
   end
 
   # The insertion itself: the job, and whether it was inserted (not a
@@ -73,8 +80,116 @@ module Queue
     keys[0]
   end
 
-  KEY = "SELECT encode(sha256(convert_to($1 || chr(10) || " +
-        "COALESCE((SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each($2::jsonb) e " +
-        "WHERE e.key IN (SELECT jsonb_array_elements_text($3::jsonb)))::text, '{}') || chr(10) || " +
-        "COALESCE(floor(extract(epoch FROM now()) * 1000 / $4::bigint)::bigint::text, ''), 'UTF8')), 'hex')"
+  # The SQL of a unique key (`.key`): `cls` the class's name, `args` the
+  # arguments (jsonb), `by` the names (a JSON array), `period` the period
+  # in milliseconds (a bigint, NULL for none).
+  def self.key_sql(cls: String, args: String, by: String, period: String) -> String
+    "encode(sha256(convert_to(#{cls} || chr(10) || " +
+      "COALESCE((SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(#{args}) e " +
+      "WHERE e.key IN (SELECT jsonb_array_elements_text(#{by})))::text, '{}') || chr(10) || " +
+      "COALESCE(floor(extract(epoch FROM now()) * 1000 / #{period})::bigint::text, ''), 'UTF8')), 'hex')"
+  end
+
+  KEY = "SELECT " + Queue.key_sql("$1", "$2::jsonb", "$3::jsonb", "$4::bigint")
+
+  # Inserts a job of `job` (its class, queue, scheduling and uniqueness)
+  # for each of `args` (JSON texts), as `.insert` does one, with one
+  # statement; one notification for the queue. The jobs, in the order of
+  # `args`: a live job of a unique key given instead of each that has one,
+  # also one inserted earlier in the same call.
+  def self.insert_all(repo: Rotor::Repo, job: New, args: Array[String]) -> Array[Enqueued]
+    none: Array[Enqueued] = []
+    return none if args.empty?
+    Queue.check(job)
+    news = args.map { |a| job.with(args: a) }
+    # (`Divider::Testing.fake`: recorded instead, each as `.insert` does.)
+    if (first = Testing.faked(news[0]))
+      return [first] + news[1...news.size].map { |n| Testing.faked(n) || first }
+    end
+    unset: Enqueued? = nil
+    out: Array[Enqueued?] = args.map { |_| unset }
+    inserted: Array[Bool] = args.map { |_| false }
+    pending = (0...args.size).to_a
+    notify = false
+    3.times do
+      break if pending.empty?
+      rows = Queue.insert_rows(repo, job, pending.map { |i| args[i] })
+      missing: Array[Int] = []
+      keys: Array[String] = []
+      rows.each_with_index do |row, j|
+        i = pending[j]
+        if (e = row[0])
+          out = out.set(i, e)
+          inserted = inserted.set(i, true)
+          notify = true if e.state == :available
+        else
+          missing = missing.push(i)
+          keys = keys.push(row[1] || "")
+        end
+      end
+      # (Each key held by a live job, perhaps one inserted just now.)
+      unless missing.empty?
+        live: Hash[String, Enqueued] = {}
+        repo.query("SELECT unique_key, id, state, scheduled_at FROM divider_jobs WHERE unique_key = ANY($1::text[]) " +
+                   "AND state IN ('scheduled', 'available', 'running', 'failed')", [keys]) do |r|
+          live = live.put(r.string(0), Enqueued.new(r.int(1), r.string(2).to_sym, r.time(3)))
+        end
+        still: Array[Int] = []
+        missing.each_with_index do |i, j|
+          if (e = live[keys[j]]?)
+            out = out.set(i, e)
+          else
+            # (It ended between the two statements: insert again.)
+            still = still.push(i)
+          end
+        end
+        missing = still
+      end
+      pending = missing
+    end
+    raise Error.new("enqueue_all: the unique key of #{job.class_name} kept changing hands") unless pending.empty?
+    repo.query("SELECT pg_notify('divider', $1)", [job.queue]) { |_| nil } if notify
+    done = out.map { |e| e.as(Enqueued) }
+    # (`Divider::Testing.inline`: each job inserted, in order.)
+    done.each_with_index { |e, i| Testing.inserted(repo, e, news[i]) if inserted[i] }
+    done
+  end
+
+  # One statement over `args`: for each, in order, the job inserted (nil
+  # when a live job holds its key) and its unique key (nil without).
+  def self.insert_rows(repo: Rotor::Repo, job: New, args: Array[String]) -> Array[[Enqueued?, String?]]
+    u = job.unique
+    after_ms = job.after ? job.after.as(Duration).to_ms : nil
+    params: Array[Object?] = [job.class_name, job.queue, args, job.priority, job.at, after_ms, job.max_attempts]
+    key = "NULL::text"
+    if u
+      params = params + [JSON.generate(u.by), u.period_ms]
+      key = Queue.key_sql("$1", "t.a::jsonb", "$8::jsonb", "$9::bigint")
+    end
+    sql = "WITH input AS (SELECT t.a::jsonb AS j, t.ord, #{key} AS k FROM unnest($3::text[]) WITH ORDINALITY AS t(a, ord)), " + INSERT_ALL
+    repo.query(sql, params) do |r|
+      id = r.int?(0)
+      e: Enqueued? = id ? Enqueued.new(id, r.string(1).to_sym, r.time(2)) : nil
+      [e, r.string?(3)]
+    end
+  end
+
+  # The rest of `.insert_rows`' statement, after its input (`j` the
+  # arguments, `ord` the position, `k` the key): the rows inserted as
+  # `INSERT` does one, nothing on a conflict of the unique key; then the
+  # input's rows in order, with what was inserted for each. Rows are
+  # matched by their arguments, the n-th input of equal arguments to the
+  # n-th row inserted with them (two such jobs are alike: which id each
+  # gets does not matter). This depends on no order of the insertion and
+  # needs no privilege on the id's sequence. An input left without a row
+  # (its key held, perhaps by an equal input just inserted) gets NULL.
+  INSERT_ALL = "due AS (SELECT COALESCE($5::timestamptz, now() + COALESCE($6::bigint, 0) * interval '1 millisecond') AS at), " +
+               "ins AS (INSERT INTO divider_jobs (class, queue, args, priority, state, scheduled_at, max_attempts, unique_key) " +
+               "SELECT $1, $2, input.j, $4, CASE WHEN due.at > now() THEN 'scheduled' ELSE 'available' END, " +
+               "due.at, $7, input.k FROM input, due ORDER BY input.ord " +
+               "ON CONFLICT (unique_key) WHERE state IN ('scheduled', 'available', 'running', 'failed') DO NOTHING " +
+               "RETURNING id, state, scheduled_at, args), " +
+               "i AS (SELECT ord, j, k, row_number() OVER (PARTITION BY j ORDER BY ord) AS n FROM input), " +
+               "o AS (SELECT id, state, scheduled_at, args, row_number() OVER (PARTITION BY args ORDER BY id) AS n FROM ins) " +
+               "SELECT o.id, o.state, o.scheduled_at, i.k FROM i LEFT JOIN o ON o.args = i.j AND o.n = i.n ORDER BY i.ord"
 end

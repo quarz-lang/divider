@@ -108,7 +108,13 @@ abstract class Job
   # - `enqueue(repo:, <the fields>, at:, after:, priority:)`, keywords
   #   only: a field with a default is optional;
   # - `enqueue_args(repo:, args:, at:, after:, priority:)`, with an args
-  #   value.
+  #   value;
+  # - `enqueue_all(repo:, args:, at:, after:, priority:)`, with an array
+  #   of args values: one job each, inserted with one statement, the
+  #   scheduling the same for all. It gives the jobs in the order of
+  #   `args`: with `unique`, the live job of a key instead of a new one,
+  #   also when two values of one call have the same key; an empty array
+  #   inserts nothing. The queue is notified once.
   #
   # A field's class is checked here: `Int`, `Integer`, `Float`,
   # `String`, `Bool`, `Symbol`, `Time`, `Bytes`, `Array`, `Hash`, `Set`,
@@ -161,6 +167,10 @@ abstract class Job
     def_class_method(:enqueue_args, keywords: [Meta::Keyword.new(:repo, Rotor::Repo, true), Meta::Keyword.new(:args, args_type, true)] + scheduling) do |given| -> Enqueued
       Job.insert(self, given, JSON.generate(given[:args]))
     end
+    doc "Inserts a job for each of `args` (`#{type.name}` values), with one statement, due now, at `at`, or `after` from the database's now, with `priority` (0 to 9, 5 by default), and gives them in the order of `args` (with `unique`, a key's live job instead of a new one)."
+    def_class_method(:enqueue_all, keywords: [Meta::Keyword.new(:repo, Rotor::Repo, true), Meta::Keyword.new(:args, Object, true)] + scheduling) do |given| -> Array[Enqueued]
+      Job.insert_all(self, given, args_type)
+    end
     doc "The class of the job's arguments: `#{type.name}`."
     def_class_method(:job_args_type, override: true) do -> Type[Object]?
       args_type
@@ -201,6 +211,26 @@ abstract class Job
     priority = given[:priority]?.as?(Int) || 5
     Queue.insert(repo, Queue::New.new(cls.name, cls.job_queue, json, priority, given[:at]?.as?(Time),
                                       given[:after]?.as?(Duration), cls.job_max_attempts, cls.job_unique, cls))
+  end
+
+  # :nodoc:
+  # Inserts a job of `cls` for each element of `given[:args]` (an array of
+  # `type` values) with the scheduling keywords of `given`.
+  def self.insert_all(cls: Type[Job], given: Hash[Symbol, Object], type: Type[Object]) -> Array[Enqueued]
+    repo = given[:repo].as(Rotor::Repo)
+    priority = given[:priority]?.as?(Int) || 5
+    list = case given[:args]
+           in Array => xs then xs
+           else raise ArgumentError.new("#{cls.name}.enqueue_all takes an array of #{type.name} values as args:")
+           end
+    texts: Array[String] = []
+    list.each_with_index do |x, i|
+      raise ArgumentError.new("#{cls.name}.enqueue_all: args[#{i}] is not a #{type.name}") unless x && x.class == type
+      texts = texts.push(JSON.generate(x))
+    end
+    job = Queue::New.new(cls.name, cls.job_queue, "{}", priority, given[:at]?.as?(Time), given[:after]?.as?(Duration),
+                         cls.job_max_attempts, cls.job_unique, cls)
+    Queue.insert_all(repo, job, texts)
   end
 
   # :nodoc:
