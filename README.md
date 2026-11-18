@@ -112,8 +112,8 @@ worker.run      # or Task.spawn { worker.run } beside an HTTP server
 
 - The worker opens connections as they are needed and closes those idle
   for 5 minutes: the jobs' pool (`job.repo`, at most `pool_size:`, 10
-  by default), a pool of 3 for its own statements (fetching, recording,
-  the heartbeat, cron), and a connection that listens for `enqueue`'s
+  by default), a pool for its own statements (fetching, recording, the
+  heartbeat, cron: the concurrency plus 2, at most 16), and a connection that listens for `enqueue`'s
   notifications, opened again if it is lost; it also polls every `poll`
   (1 second) for scheduled jobs. A job holds a connection only while a
   statement runs, or for the whole of a `job.repo.transaction`: a queue

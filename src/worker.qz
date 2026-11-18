@@ -20,9 +20,10 @@
 #   whole of a `job.repo.transaction`: many jobs waiting on something
 #   else need few connections, and a job that needs one when all are in
 #   use waits for one;
-# - a pool of 3 for the worker's own statements (fetching, recording how
+# - a pool for the worker's own statements (fetching, recording how
 #   attempts ended, the heartbeat, the cron entries), which jobs holding
-#   every connection of theirs cannot hold up;
+#   every connection of theirs cannot hold up: the queues' concurrency
+#   plus 2 connections, at most 16;
 # - one connection that listens for `enqueue`'s notifications.
 #
 # A worker fetches only the classes in `jobs`, and leaves the others in
@@ -102,7 +103,8 @@ class Worker
     size = pool_size || POOL_SIZE
     raise ArgumentError.new("pool_size is at least 1, not #{size}") if size < 1
     @pool = PG::Pool.new(@url, size)
-    @own = PG::Pool.new(@url, OWN_POOL_SIZE)
+    own = qs.values.sum + 2
+    @own = PG::Pool.new(@url, own < OWN_POOL_MAX ? own : OWN_POOL_MAX)
     @node = node || "#{Worker.hostname}-#{Process.pid}-#{Random.rand(1 << 32).to_s(16)}"
     @stop = Channel[Nil].new
     @force = Channel[Nil].new
@@ -465,8 +467,8 @@ class Worker
   # The jobs' pool's size when `pool_size` is not given.
   POOL_SIZE = 10
 
-  # The size of the pool of the worker's own statements.
-  OWN_POOL_SIZE = 3
+  # The most connections of the pool of the worker's own statements.
+  OWN_POOL_MAX = 16
 
   # The longest the listener waits for a notification at once.
   LISTEN_WAIT = 500.ms
