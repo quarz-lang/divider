@@ -119,14 +119,14 @@ abstract class Job
   # A field's class is checked here: `Int`, `Integer`, `Float`,
   # `String`, `Bool`, `Symbol`, `Time`, `Bytes`, `Array`, `Hash`, `Set`,
   # another `data` type of such fields, or a nullable or union one
-  # (which `Type#fields` shows as `Object`). Only the outer class is seen
-  # (quarz-lang/quarz#401): a nullable or union field and the elements of
-  # a collection are not checked here (`Pen?` or `Array[Pen]` passes, and
-  # is found when the worker decodes the job); the keywords are typed by
-  # those classes only, without type arguments or nullability, and a
-  # collection's keyword is typed `Object` (a keyword's class carries no
-  # type arguments), while `enqueue_args` checks its value fully against
-  # the type. The worker decodes the stored arguments (`JSON.decode`) and
+  # (which `Type#fields` shows as `Object`). Only the outer class is
+  # checked here: a nullable or union field and the elements of a
+  # collection are not (`Pen?` or `Array[Pen]` passes, and is found when
+  # the worker decodes the job). The keywords are typed by the fields'
+  # declared types in full (`Meta::Field#type_ref`: `ids: Array[Int]`,
+  # `note: String?`), and `enqueue_all`'s `args:` as an `Array` of the
+  # type, so a call with a value of another type does not compile. The
+  # worker decodes the stored arguments (`JSON.decode`) and
   # calls `perform(args, job)`; arguments that do not decode discard the
   # job with `Divider::ArgsError`, which names where. A field cannot be
   # named `repo`, `at`, `after` or `priority`, and `job_args` comes once.
@@ -154,7 +154,7 @@ abstract class Job
                   Meta::Keyword.new(:after, Duration, false, nullable: true),
                   Meta::Keyword.new(:priority, Int, false)]
     keywords = [Meta::Keyword.new(:repo, Rotor::Repo, true)] +
-               fields.map { |f| Meta::Keyword.new(f.name, Job.keyword_type(f.type), !f.default) } + scheduling
+               fields.map { |f| Job.keyword(f) } + scheduling
     names = fields.map(&:name)
     doc "Inserts the job with the arguments given (#{names.map { |n| "`#{n}`" }.join(", ")}), due now, at `at`, or `after` from the database's now, with `priority` (0 to 9, 5 by default)."
     def_class_method(:enqueue, keywords: keywords) do |given| -> Enqueued
@@ -168,8 +168,9 @@ abstract class Job
       Job.insert(self, given, JSON.generate(given[:args]))
     end
     doc "Inserts a job for each of `args` (`#{type.name}` values), with one statement, due now, at `at`, or `after` from the database's now, with `priority` (0 to 9, 5 by default), and gives them in the order of `args` (with `unique`, a key's live job instead of a new one)."
-    def_class_method(:enqueue_all, keywords: [Meta::Keyword.new(:repo, Rotor::Repo, true), Meta::Keyword.new(:args, Object, true)] + scheduling) do |given| -> Array[Enqueued]
-      Job.insert_all(self, given, args_type)
+    all_args = Meta::Keyword.typed(:args, Meta::TypeRef.of(Array, [Meta::TypeRef.of(args_type)]), true)
+    def_class_method(:enqueue_all, keywords: [Meta::Keyword.new(:repo, Rotor::Repo, true), all_args] + scheduling) do |given| -> Array[Enqueued]
+      Job.insert_all(self, given)
     end
     doc "The class of the job's arguments: `#{type.name}`."
     def_class_method(:job_args_type, override: true) do -> Type[Object]?
@@ -192,12 +193,10 @@ abstract class Job
   def self.job_args_type -> Type[Object]? = nil
 
   # :nodoc:
-  # The class of `enqueue`'s keyword for a field of class `t`: `Object` for
-  # a collection, whose type arguments a keyword cannot carry (the value
-  # is checked when the job is decoded).
-  static def self.keyword_type(t: Type[Object]) -> Type[Object]
-    t == Array || t == Hash || t == Set ? Object : t
-  end
+  # `enqueue`'s keyword for the field `f`, typed by the field's declared
+  # type in full (`Array[Int]`, `String?`), optional when it has a
+  # default.
+  static def self.keyword(f: Meta::Field) -> Meta::Keyword = Meta::Keyword.typed(f.name, f.type_ref, !f.default)
 
   # :nodoc:
   # The keywords `enqueue` takes beside the arguments.
@@ -215,19 +214,14 @@ abstract class Job
 
   # :nodoc:
   # Inserts a job of `cls` for each element of `given[:args]` (an array of
-  # `type` values) with the scheduling keywords of `given`.
-  def self.insert_all(cls: Type[Job], given: Hash[Symbol, Object], type: Type[Object]) -> Array[Enqueued]
+  # its args values) with the scheduling keywords of `given`.
+  def self.insert_all(cls: Type[Job], given: Hash[Symbol, Object]) -> Array[Enqueued]
     repo = given[:repo].as(Rotor::Repo)
     priority = given[:priority]?.as?(Int) || 5
-    list = case given[:args]
-           in Array => xs then xs
-           else raise ArgumentError.new("#{cls.name}.enqueue_all takes an array of #{type.name} values as args:")
-           end
-    texts: Array[String] = []
-    list.each_with_index do |x, i|
-      raise ArgumentError.new("#{cls.name}.enqueue_all: args[#{i}] is not a #{type.name}") unless x && x.class == type
-      texts = texts.push(JSON.generate(x))
-    end
+    # (`args:` is an `Array` of the job's args type: the call was
+    # checked so.)
+    list = given[:args].as(Array[Object])
+    texts = list.map { |x| JSON.generate(x) }
     job = Queue::New.new(cls.name, cls.job_queue, "{}", priority, given[:at]?.as?(Time), given[:after]?.as?(Duration),
                          cls.job_max_attempts, cls.job_unique, cls)
     Queue.insert_all(repo, job, texts)
