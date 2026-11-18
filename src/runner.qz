@@ -56,8 +56,7 @@ class Runner
     err = error_json(row, e)
     # (Through `repo`: not behind the jobs' own statements.)
     requested = begin
-      found = @repo.query("SELECT cancelled_at IS NOT NULL FROM divider_jobs WHERE id = $1", [row.id]) { |r| r.bool(0) }
-      found.first? || false
+      Context.cancel_requested?(@repo, row.id)
     rescue StandardError
       false
     end
