@@ -136,6 +136,16 @@ class WtRetryRaises < Divider::Job
   end
 end
 
+# Holds a connection of the jobs' pool for 1.5 seconds.
+class WtHold < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    job.repo.transaction do |tx|
+      tx.exec("SELECT 1")
+      Task.sleep(1500.ms)
+    end
+  end
+end
+
 class WtQuick < Divider::Job
   def perform(job: Divider::Context) -> Void
     Task.sleep(5.ms)
@@ -146,7 +156,7 @@ end
 # with two workers, the notification, failures and retries, Discard,
 # Snooze, timeouts, cancellation, shutdown, rescue and pruning.
 class WorkerTest < Test::Case
-  ALL = [WtCount, WtFail, WtDiscard, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo, WtArgsError, WtQuick, WtSnoozeNow, WtRetry, WtRetryNegative, WtRetryRaises]
+  ALL = [WtCount, WtFail, WtDiscard, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo, WtArgsError, WtQuick, WtSnoozeNow, WtRetry, WtRetryNegative, WtRetryRaises, WtHold]
 
   def with_repo(&: (Rotor::Repo, String) -> Void) -> Void
     PG::Testing.with_cluster do |url|
@@ -344,6 +354,34 @@ class WorkerTest < Test::Case
         got = got.push(m)
       end
       assert_equal(["raises (WtRetryRaises #{job.id} 1)", "no delay (WtRetryRaises #{job.id} 1)"], got)
+    end
+  end
+
+  # Jobs holding every connection of the jobs' pool in transactions hold
+  # up neither the heartbeat nor how another job's attempt is recorded:
+  # those go through the worker's own pool.
+  def test_jobs_holding_their_pool_do_not_stop_the_worker
+    with_repo do |repo, url|
+      holders = [WtHold.enqueue(repo), WtHold.enqueue(repo)]
+      w = Divider::Worker.new(url, jobs: ALL, queues: {default: 3}, pool_size: 2, poll: 50.ms, node: "test-node",
+                              heartbeat: 100.ms, on_error: ->(e: Exception, c: Divider::Context) { nil })
+      t = Task.spawn { w.run }
+      begin
+        holders.each { |h| wait_state(repo, h.id, "running") }
+        beat = ->() { repo.query("SELECT max(locked_at) FROM divider_jobs WHERE class = 'WtHold'") { |r| r.time(0) }[0] }
+        first = beat.call
+        quick = WtQuick.enqueue(repo)
+        wait_state(repo, quick.id, "completed")
+        # Recorded, and beaten, while both holders still run.
+        assert_equal("completed", state(repo, quick.id))
+        assert_equal(["running", "running"], holders.map { |h| state(repo, h.id) })
+        Task.sleep(300.ms)
+        assert_true(beat.call > first, "the heartbeat moved locked_at on")
+      ensure
+        w.shutdown(5.seconds)
+        t.await
+      end
+      assert_equal(["completed", "completed"], holders.map { |h| state(repo, h.id) })
     end
   end
 
