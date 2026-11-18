@@ -1,9 +1,11 @@
 # :nodoc:
-# Runs attempts of jobs and records how they ended, over one repository:
-# what a worker makes for each attempt (over its pool), and
-# `Divider::Testing` over the test's repository.
+# Runs attempts of jobs and records how they ended: what a worker makes
+# for each attempt, and `Divider::Testing` over the test's repository.
+# The rows are read and written through `repo`; the jobs get `job_repo`
+# (a worker's: over the jobs' pool, `repo` over its own).
 class Runner
   @repo: Rotor::Repo
+  @job_repo: Rotor::Repo
   @jobs: Hash[String, Type[Job]]
   @node: String
   @keep_completed_ms: Int
@@ -11,14 +13,16 @@ class Runner
   @on_event: (shareable (Event) -> Void)?
 
   def initialize(@repo: Rotor::Repo, @jobs: Hash[String, Type[Job]], @node: String, @keep_completed_ms: Int,
-                 @on_error: (shareable (Exception, Context) -> Void)?, @on_event: (shareable (Event) -> Void)?)
+                 @on_error: (shareable (Exception, Context) -> Void)?, @on_event: (shareable (Event) -> Void)?,
+                 job_repo: Rotor::Repo? = nil)
+    @job_repo = job_repo || @repo
   end
 
   # :nodoc:
   # Runs the job and tells how its attempt ended; raises `Task::Cancelled`
   # only when the worker cancelled it.
   def run_attempt(row: Fetched) -> Outcome
-    ctx = Context.new(row.id, row.class_name, row.queue, row.attempt, row.max_attempts, row.inserted_at, row.scheduled_at, @repo)
+    ctx = Context.new(row.id, row.class_name, row.queue, row.attempt, row.max_attempts, row.inserted_at, row.scheduled_at, @job_repo)
     started = Time.now
     begin
       emit(:started, row, nil, nil)
@@ -50,8 +54,9 @@ class Runner
   def failure(row: Fetched, ctx: Context, e: Exception, started: Time) -> Outcome
     ms = Worker.ms_since(started)
     err = error_json(row, e)
+    # (Through `repo`: not behind the jobs' own statements.)
     requested = begin
-      ctx.cancel_requested?
+      Context.cancel_requested?(@repo, row.id)
     rescue StandardError
       false
     end

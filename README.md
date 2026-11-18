@@ -110,10 +110,14 @@ worker.run      # or Task.spawn { worker.run } beside an HTTP server
 # Divider.serve(url, jobs: ..., queues: ...): the same as a process's main (TERM/INT).
 ```
 
-- The worker opens its own pool (the queues' concurrency plus 2
-  connections) and a connection that listens for `enqueue`'s
+- The worker opens connections as they are needed and closes those idle
+  for 5 minutes: the jobs' pool (`job.repo`, at most `pool_size:`, 10
+  by default), a pool for its own statements (fetching, recording, the
+  heartbeat, cron: the concurrency plus 2, at most 16), and a connection that listens for `enqueue`'s
   notifications, opened again if it is lost; it also polls every `poll`
-  (1 second) for scheduled jobs.
+  (1 second) for scheduled jobs. A job holds a connection only while a
+  statement runs, or for the whole of a `job.repo.transaction`: a queue
+  of many jobs waiting on something else needs few connections.
 - `shutdown(grace)` stops fetching and gives the running jobs `grace` to
   finish; those still running are cancelled and go back to `available`,
   the attempt not counted (or to `cancelled`, when that was asked). A

@@ -12,9 +12,19 @@
 # worker.run      # until shutdown; or Task.spawn { worker.run } beside an HTTP server
 # ```
 #
-# The worker opens its own pool of connections to `url` (by default the
-# queues' concurrency plus 2) and one connection that listens for
-# `enqueue`'s notifications.
+# The worker opens connections to `url` as they are needed, and closes
+# those idle for 5 minutes:
+#
+# - the jobs' pool (`job.repo`), of at most `pool_size` connections (10
+#   by default). A job holds one only while a statement runs, or for the
+#   whole of a `job.repo.transaction`: many jobs waiting on something
+#   else need few connections, and a job that needs one when all are in
+#   use waits for one;
+# - a pool for the worker's own statements (fetching, recording how
+#   attempts ended, the heartbeat, the cron entries), which jobs holding
+#   every connection of theirs cannot hold up: the queues' concurrency
+#   plus 2 connections, at most 16;
+# - one connection that listens for `enqueue`'s notifications.
 #
 # A worker fetches only the classes in `jobs`, and leaves the others in
 # the table, never touching them: every node running a queue should know
@@ -34,7 +44,10 @@ class Worker
   include Shareable
 
   @url: String
+  # The jobs' pool (`job.repo`).
   @pool: PG::Pool
+  # The pool of the worker's own statements.
+  @own: PG::Pool
   @jobs: Hash[String, Type[Job]]
   @queues: Hash[String, Int]
   @poll: Duration
@@ -59,7 +72,8 @@ class Worker
 
   # A worker of `jobs` (the classes it may run) over the database `url`,
   # running `queues` (each queue's name, and how many of its jobs run at
-  # once), and the recurring jobs of `cron`. `node` names this process in
+  # once), and the recurring jobs of `cron`. `pool_size` bounds the jobs'
+  # pool (10 by default; see above). `node` names this process in
   # the rows it runs (by default
   # `HOSTNAME-pid-` and a random suffix): it must differ from every other
   # running worker's.
@@ -86,9 +100,11 @@ class Worker
     @queues = qs
     raise ArgumentError.new("poll is at least 10ms, not #{@poll}") if @poll < 10.ms
     raise ArgumentError.new("stale_after (#{@stale_after}) must exceed heartbeat (#{@heartbeat})") if @stale_after <= @heartbeat
-    size = pool_size || qs.values.sum + 2
-    raise ArgumentError.new("pool_size is at least 2, not #{size}") if size < 2
+    size = pool_size || POOL_SIZE
+    raise ArgumentError.new("pool_size is at least 1, not #{size}") if size < 1
     @pool = PG::Pool.new(@url, size)
+    own = qs.values.sum + 2
+    @own = PG::Pool.new(@url, own < OWN_POOL_MAX ? own : OWN_POOL_MAX)
     @node = node || "#{Worker.hostname}-#{Process.pid}-#{Random.rand(1 << 32).to_s(16)}"
     @stop = Channel[Nil].new
     @force = Channel[Nil].new
@@ -134,7 +150,10 @@ class Worker
         nil
       end
     ensure
-      Task.uncancellable { @pool.close }
+      Task.uncancellable do
+        @pool.close
+        @own.close
+      end
     end
   end
 
@@ -315,9 +334,13 @@ class Worker
   end
 
   # :nodoc:
-  # A runner of attempts over the worker's pool (made in the task that
-  # uses it: a repository is not Shareable).
-  def runner -> Runner = Runner.new(Rotor::Repo.new(pool: @pool), @jobs, @node, @keep_completed.to_ms, @on_error, @on_event)
+  # A runner of attempts: the rows through the worker's own pool, the
+  # jobs' `repo` over theirs (made in the task that uses it: a repository
+  # is not Shareable).
+  def runner -> Runner
+    Runner.new(Rotor::Repo.new(pool: @own), @jobs, @node, @keep_completed.to_ms, @on_error, @on_event,
+               job_repo: Rotor::Repo.new(pool: @pool))
+  end
 
   # :nodoc:
   # The cron entries: every `CRON_CHECK`, until `done` is closed, those
@@ -329,7 +352,7 @@ class Worker
   def schedule(done: Channel[Nil]) -> Void
     cron = @cron
     return if cron.nil?
-    repo = Rotor::Repo.new(pool: @pool)
+    repo = Rotor::Repo.new(pool: @own)
     starting = true
     while true
       begin
@@ -353,7 +376,7 @@ class Worker
   # :nodoc:
   # The maintenance: every `heartbeat`, until `done` is closed.
   def maintain(done: Channel[Nil]) -> Void
-    repo = Rotor::Repo.new(pool: @pool)
+    repo = Rotor::Repo.new(pool: @own)
     loop do
       begin
         Channel.select do |sel|
@@ -403,7 +426,7 @@ class Worker
   # Up to `limit` due jobs of the queue `q` whose class this worker knows,
   # now `running` on this node.
   def fetch(q: String, limit: Int) -> Array[Fetched]
-    repo = Rotor::Repo.new(pool: @pool)
+    repo = Rotor::Repo.new(pool: @own)
     begin
       # (Not interrupted once sent: the rows the server claimed are in
       # hand, to run or give back.)
@@ -440,6 +463,12 @@ class Worker
 
   # How often the cron entries are checked.
   CRON_CHECK = 15.seconds
+
+  # The jobs' pool's size when `pool_size` is not given.
+  POOL_SIZE = 10
+
+  # The most connections of the pool of the worker's own statements.
+  OWN_POOL_MAX = 16
 
   # The longest the listener waits for a notification at once.
   LISTEN_WAIT = 500.ms

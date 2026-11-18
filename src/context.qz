@@ -45,8 +45,12 @@ class Context
   # Whether `Divider.cancel` asked the job to stop (a query): a long job
   # polls it, and raises `Divider::Cancelled` to stop, which ends it
   # `cancelled` (returning instead ends it `completed`).
-  def cancel_requested? -> Bool
-    found = @repo.query("SELECT cancelled_at IS NOT NULL FROM divider_jobs WHERE id = $1", [@id]) { |r| r.bool(0) }
+  def cancel_requested? -> Bool = Context.cancel_requested?(@repo, @id)
+
+  # :nodoc:
+  # Whether a cancellation of the job `id` was asked, read through `repo`.
+  def self.cancel_requested?(repo: Rotor::Repo, id: Int) -> Bool
+    found = repo.query("SELECT cancelled_at IS NOT NULL FROM divider_jobs WHERE id = $1", [id]) { |r| r.bool(0) }
     found.first? || false
   end
 
