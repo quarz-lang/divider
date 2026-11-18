@@ -31,6 +31,14 @@ class TtSnooze < Divider::Job
   end
 end
 
+class TtBatch < Divider::Job
+  data Args = (n: Int)
+  job_args Args
+  def perform(args: Args, job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO tt_runs (job_id) VALUES ($1)", [job.id])
+  end
+end
+
 # `Divider::Testing`: fake, inline (in and out of transactions) and drain.
 class TestingTest < Test::Case
   include Divider::Testing::Assertions
@@ -100,6 +108,23 @@ class TestingTest < Test::Case
     assert_false(Divider::Testing.args_match?(stored, {missing: 1}))
     none: Hash[Symbol, Object] = {}
     assert_true(Divider::Testing.args_match?(stored, none))
+  end
+
+  # `enqueue_all` under `fake` records each job; under `inline` runs each.
+  def test_enqueue_all_fake_and_inline
+    with_repo do |repo|
+      faked = Divider::Testing.fake do
+        TtBatch.enqueue_all(repo: repo, args: [TtBatch::Args.new(1), TtBatch::Args.new(2)])
+      end
+      assert_equal([-1, -2], faked.map(&:id))
+      assert_equal(["{\"n\":1}", "{\"n\":2}"], Divider::Testing.enqueued(TtBatch).map(&:args))
+      assert_equal(0, count(repo))
+      ran = Divider::Testing.inline(repo) do
+        TtBatch.enqueue_all(repo: repo, args: [TtBatch::Args.new(1), TtBatch::Args.new(2), TtBatch::Args.new(3)])
+      end
+      assert_equal(3, runs(repo))
+      assert_equal(["completed"], repo.query("SELECT DISTINCT state FROM divider_jobs WHERE id = ANY($1::bigint[])", [ran.map(&:id)]) { |r| r.string(0) })
+    end
   end
 
   def test_inline_runs_at_once_outside_a_transaction
