@@ -16,11 +16,7 @@ module Queue
   # commit) when it is due now. With `unique`, a live job of the same key
   # is given instead, and nothing is inserted.
   def self.insert(repo: Rotor::Repo, job: New) -> Enqueued
-    raise ArgumentError.new("enqueue takes at: or after:, not both") if job.at && job.after
-    p = job.priority
-    raise ArgumentError.new("a priority is 0 to 9, not #{p}") if p < 0 || p > 9
-    delay = job.after
-    raise ArgumentError.new("after: is not negative, not #{delay}") if delay && delay.to_ms < 0
+    Queue.check(job)
     # (`Divider::Testing`: recorded instead, or run once inserted.)
     if (faked = Testing.faked(job))
       return faked
@@ -28,6 +24,17 @@ module Queue
     e, inserted = Queue.insert_row(repo, job)
     Testing.inserted(repo, e, job) if inserted
     e
+  end
+
+  # Raises `ArgumentError` for scheduling `enqueue` refuses: both `at`
+  # and `after`, a priority outside 0 to 9, a negative `after`.
+  def self.check(job: New) -> Void
+    raise ArgumentError.new("enqueue takes at: or after:, not both") if job.at && job.after
+    p = job.priority
+    raise ArgumentError.new("a priority is 0 to 9, not #{p}") if p < 0 || p > 9
+    delay = job.after
+    raise ArgumentError.new("after: is not negative, not #{delay}") if delay && delay.to_ms < 0
+    nil
   end
 
   # The insertion itself: the job, and whether it was inserted (not a
@@ -93,11 +100,7 @@ module Queue
   def self.insert_all(repo: Rotor::Repo, job: New, args: Array[String]) -> Array[Enqueued]
     none: Array[Enqueued] = []
     return none if args.empty?
-    raise ArgumentError.new("enqueue takes at: or after:, not both") if job.at && job.after
-    p = job.priority
-    raise ArgumentError.new("a priority is 0 to 9, not #{p}") if p < 0 || p > 9
-    delay = job.after
-    raise ArgumentError.new("after: is not negative, not #{delay}") if delay && delay.to_ms < 0
+    Queue.check(job)
     news = args.map { |a| job.with(args: a) }
     # (`Divider::Testing.fake`: recorded instead, each as `.insert` does.)
     if (first = Testing.faked(news[0]))
@@ -163,8 +166,7 @@ module Queue
       params = params + [JSON.generate(u.by), u.period_ms]
       key = Queue.key_sql("$1", "t.a::jsonb", "$8::jsonb", "$9::bigint")
     end
-    sql = "WITH input AS (SELECT t.a, t.ord, nextval(pg_get_serial_sequence('divider_jobs', 'id')) AS id, #{key} AS k " +
-          "FROM unnest($3::text[]) WITH ORDINALITY AS t(a, ord)), " + INSERT_ALL
+    sql = "WITH input AS (SELECT t.a::jsonb AS j, t.ord, #{key} AS k FROM unnest($3::text[]) WITH ORDINALITY AS t(a, ord)), " + INSERT_ALL
     repo.query(sql, params) do |r|
       id = r.int?(0)
       e: Enqueued? = id ? Enqueued.new(id, r.string(1).to_sym, r.time(2)) : nil
@@ -172,16 +174,22 @@ module Queue
     end
   end
 
-  # The rest of `.insert_rows`' statement, after its input: each row given
-  # its id up front (so that the result maps to the input's order), due
-  # as in `INSERT`, nothing on a conflict of the unique key; the input's
-  # rows in order, with what was inserted for each.
+  # The rest of `.insert_rows`' statement, after its input (`j` the
+  # arguments, `ord` the position, `k` the key): the rows inserted as
+  # `INSERT` does one, nothing on a conflict of the unique key; then the
+  # input's rows in order, with what was inserted for each. Rows are
+  # matched by their arguments, the n-th input of equal arguments to the
+  # n-th row inserted with them (two such jobs are alike: which id each
+  # gets does not matter). This depends on no order of the insertion and
+  # needs no privilege on the id's sequence. An input left without a row
+  # (its key held, perhaps by an equal input just inserted) gets NULL.
   INSERT_ALL = "due AS (SELECT COALESCE($5::timestamptz, now() + COALESCE($6::bigint, 0) * interval '1 millisecond') AS at), " +
-               "ins AS (INSERT INTO divider_jobs (id, class, queue, args, priority, state, scheduled_at, max_attempts, unique_key) " +
-               "OVERRIDING SYSTEM VALUE " +
-               "SELECT input.id, $1, $2, input.a::jsonb, $4, CASE WHEN due.at > now() THEN 'scheduled' ELSE 'available' END, " +
+               "ins AS (INSERT INTO divider_jobs (class, queue, args, priority, state, scheduled_at, max_attempts, unique_key) " +
+               "SELECT $1, $2, input.j, $4, CASE WHEN due.at > now() THEN 'scheduled' ELSE 'available' END, " +
                "due.at, $7, input.k FROM input, due ORDER BY input.ord " +
                "ON CONFLICT (unique_key) WHERE state IN ('scheduled', 'available', 'running', 'failed') DO NOTHING " +
-               "RETURNING id, state, scheduled_at) " +
-               "SELECT ins.id, ins.state, ins.scheduled_at, input.k FROM input LEFT JOIN ins ON ins.id = input.id ORDER BY input.ord"
+               "RETURNING id, state, scheduled_at, args), " +
+               "i AS (SELECT ord, j, k, row_number() OVER (PARTITION BY j ORDER BY ord) AS n FROM input), " +
+               "o AS (SELECT id, state, scheduled_at, args, row_number() OVER (PARTITION BY args ORDER BY id) AS n FROM ins) " +
+               "SELECT o.id, o.state, o.scheduled_at, i.k FROM i LEFT JOIN o ON o.args = i.j AND o.n = i.n ORDER BY i.ord"
 end
