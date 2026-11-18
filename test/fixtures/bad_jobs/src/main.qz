@@ -64,7 +64,12 @@ def calls(repo: Rotor::Repo) -> Void
   Fine.enqueue(repo: repo, user_id: "1")
   Fine.enqueue(repo: repo, user_id: 1, colour: "red")
   Fine.enqueue_args(repo: repo, args: 3)
+  Fine.enqueue_all(repo: repo, args: "not an array")
+  Fine.enqueue_all(repo: repo, args: [Other.new(1)])
+  Typed.enqueue(repo: repo, ids: ["x"])
+  Typed.enqueue(repo: repo, ids: [1], note: 3)
 end
+
 
 # (The `perform(args, job)` of the classes above that declare `Good`.)
 class GoodBase < Divider::Job
@@ -82,5 +87,17 @@ class Redeclared < Fine
   job_args Other
 
   def perform(args: Other, job: Divider::Context) -> Void
+  end
+end
+
+# Fields whose types have type arguments, or a nil (divider#33).
+data TypedArgs = (ids: Array[Int], note: String? = nil, counts: Hash[String, Int] = {})
+
+class Typed < GoodBase2
+  job_args TypedArgs
+end
+
+class GoodBase2 < Divider::Job
+  def perform(args: TypedArgs, job: Divider::Context) -> Void
   end
 end

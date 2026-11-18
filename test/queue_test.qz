@@ -219,11 +219,10 @@ class QueueTest < Test::Case
       none: Array[QtBatch::Args] = []
       assert_equal(0, QtBatch.enqueue_all(repo: repo, args: none).size)
       assert_equal(7, count(repo))
-      # What enqueue refuses, and what is no array of the arguments.
+      # What enqueue refuses (an `args:` that is no array of the arguments
+      # does not compile: test/fixtures/bad_jobs).
       assert_raise(ArgumentError) { QtBatch.enqueue_all(repo: repo, args: [QtBatch::Args.new(1)], at: Time.now, after: 1.second) }
       assert_raise(ArgumentError) { QtBatch.enqueue_all(repo: repo, args: [QtBatch::Args.new(1)], priority: 10) }
-      assert_raise(ArgumentError) { QtBatch.enqueue_all(repo: repo, args: [QtBatchOnce::Args.new(1, "x")]) }
-      assert_raise(ArgumentError) { QtBatch.enqueue_all(repo: repo, args: QtBatch::Args.new(1)) }
       assert_equal(7, count(repo))
     end
   end

@@ -73,11 +73,12 @@ end
 - A job with `job_args` is enqueued with keywords: `repo:`, its arguments
   (optional where the data type has a default), and the scheduling ones;
   an argument named `repo`, `at`, `after` or `priority` is refused. Those
-  keywords are checked by their outer class only (`Type#fields` shows a
-  nullable field as `Object` and `Array[Int]` as `Array`, and a keyword
-  for a collection is typed `Object`: quarz-lang/quarz#401),
-  and `job_args` checks a field's encodability by its outer class only; a
-  value that does not fit is found when the worker decodes the job
+  keywords have the fields' declared types in full (`ids: Array[Int]`,
+  `note: String?`), and `enqueue_all`'s `args:` is an `Array` of the
+  `Args` type, so a call with a value of another type does not compile
+  (#33). `job_args` checks a field's encodability by its outer class
+  only; a stored value that does not fit (a row written by an older
+  deploy) is found when the worker decodes the job
   (`Divider::ArgsError`, discarded, the error naming where: a deploy that
   changes an `Args` type should add fields with defaults). `enqueue_args` takes an `Args` value,
   checked fully. The argument-less `enqueue(repo)` a job with `job_args`
