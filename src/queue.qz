@@ -6,7 +6,7 @@ module Queue
   CHANNEL = "divider"
 
   # A job to insert: its class's name, queue, arguments (JSON text of an
-  # object), priority, when it is due (`at`, or `after` from the
+  # object), priority, when it is due ([at], or [after] from the
   # database's now, or now), attempts and uniqueness.
   data New = (class_name: String, queue: String, args: String, priority: Int, at: Time?, after: Duration?,
            max_attempts: Int, unique: Unique?, job: Type[Job]? = nil)

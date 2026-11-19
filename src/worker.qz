@@ -30,13 +30,13 @@
 # the table, never touching them: every node running a queue should know
 # all of that queue's classes. Queues are how work is split between
 # nodes of different kinds (a mail node, a report node). A row whose
-# class no deploy knows any more stays `available` until `Divider.cancel`
+# class no deploy knows any more stays `available` until [Divider.cancel]
 # removes it.
 #
 # An attempt that returns ends the job `completed`. One that raises
-# `Divider::Discard` discards it; `Divider::Snooze` puts it off without
-# counting the attempt; `Divider::Cancelled`, or an exception after
-# `Divider.cancel` asked it to stop, cancels it; any other exception (a
+# [Divider::Discard] discards it; [Divider::Snooze] puts it off without
+# counting the attempt; [Divider::Cancelled], or an exception after
+# [Divider.cancel] asked it to stop, cancels it; any other exception (a
 # `timeout` too) fails the attempt, recorded in the job's `errors`, and
 # the job runs again after `attempt ** 4 + 15` seconds plus a random 0 to
 # 30 (as Oban), until its `max_attempts`, after which it is discarded.
@@ -73,7 +73,7 @@ class Worker
   # A worker of `jobs` (the classes it may run) over the database `url`,
   # running `queues` (each queue's name, and how many of its jobs run at
   # once), and the recurring jobs of `cron`. `pool_size` bounds the jobs'
-  # pool (10 by default; see above). `node` names this process in
+  # pool (10 by default; see above). [node] names this process in
   # the rows it runs (by default
   # `HOSTNAME-pid-` and a random suffix): it must differ from every other
   # running worker's.
@@ -116,7 +116,7 @@ class Worker
   # This process's name in the rows it runs.
   def node -> String = @node
 
-  # Runs the queues until `shutdown`, then closes the worker's
+  # Runs the queues until [shutdown], then closes the worker's
   # connections. A worker runs once.
   def run -> Void
     first = true
@@ -160,7 +160,7 @@ class Worker
   # Stops fetching, lets the running jobs finish for `grace` (nil: as long
   # as they take), then cancels them: their rows go back to `available`,
   # the attempt not counted (or to `cancelled`, when that was asked). A
-  # second call cancels them at once. `run` returns then.
+  # second call cancels them at once. [run] returns then.
   def shutdown(grace: Duration? = nil) -> Void
     if @stop.closed?
       @force.close
@@ -535,11 +535,11 @@ data Outcome = (sql: String, error_json: String?, number: Int?, kind: Symbol, ms
 data Fetched = (id: Int, class_name: String, queue: String, args: String, attempt: Int, max_attempts: Int,
                 inserted_at: Time, scheduled_at: Time)
 
-# What happened to a job, for `on_event`: `kind` is `:started`,
+# What happened to a job, for `on_event`: [kind] is `:started`,
 # `:completed`, `:failed`, `:discarded`, `:snoozed`, `:cancelled` or
 # `:rescued` (given back by maintenance, its node having stopped beating);
-# `duration_ms` the attempt's time (nil for `:started` and `:rescued`),
-# `error` the message of what it raised.
+# [duration_ms] the attempt's time (nil for `:started` and `:rescued`),
+# [error] the message of what it raised.
 data Event = (kind: Symbol, id: Int, class_name: String, queue: String, attempt: Int, duration_ms: Int?, error: String?)
 
 # A worker for a process of its own: runs `Worker.new(url, ...)` until

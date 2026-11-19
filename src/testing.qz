@@ -49,7 +49,7 @@ module Testing
   STATE = Atom[State].new(State.new(:off, Array[Recorded].new, Array[[Int, Type[Job]]].new, -1))
 
   # Runs the block with enqueues recorded instead of inserted (each given
-  # an `Enqueued` with an id from -1 down, `available`, or `scheduled` at
+  # an [Enqueued] with an id from -1 down, `available`, or `scheduled` at
   # `at`); the records stay readable (`enqueued`) until the next `fake`.
   def self.fake[R](&: () -> R) -> R
     Testing.enter(:fake)
@@ -72,7 +72,7 @@ module Testing
   # one enqueued inside a transaction at the next enqueue outside one, or
   # when the block ends (a rolled-back one has no row, and does not run).
   # Jobs run as a worker runs them (their outcome recorded in the row): a
-  # `Snooze` leaves the job scheduled, not run again.
+  # [Snooze] leaves the job scheduled, not run again.
   def self.inline[R](repo: Rotor::Repo, &: () -> R) -> R
     Testing.enter(:inline)
     begin
@@ -99,7 +99,7 @@ module Testing
     ids.count { |id| Testing.run_one(repo, id, by_name) }
   end
 
-  # The assertions of enqueued jobs, for a `Test::Case` that includes
+  # The assertions of enqueued jobs, for a [Test::Case] that includes
   # them.
   module Assertions
     include Test::Assertions

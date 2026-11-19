@@ -20,7 +20,7 @@ its comments the decisions taken while it was built.
 
 ## The schema
 
-`Divider::Migrations.all` are rotor migrations (`divider_jobs`, and
+[Divider::Migrations.all] are rotor migrations (`divider_jobs`, and
 `divider_cron` for the cron entries): add them to your migrator's list.
 
 ```crystal
@@ -74,31 +74,31 @@ end
   (optional where the data type has a default), and the scheduling ones;
   an argument named `repo`, `at`, `after` or `priority` is refused. Those
   keywords have the fields' declared types in full (`ids: Array[Int]`,
-  `note: String?`), and `enqueue_all`'s `args:` is an `Array` of the
+  `note: String?`), and `enqueue_all`'s `args:` is an [Array] of the
   `Args` type, so a call with a value of another type does not compile
   (#33). `job_args` checks a field's encodability by its outer class
   only; a stored value that does not fit (a row written by an older
   deploy) is found when the worker decodes the job
-  (`Divider::ArgsError`, discarded, the error naming where: a deploy that
+  ([Divider::ArgsError], discarded, the error naming where: a deploy that
   changes an `Args` type should add fields with defaults). `enqueue_args` takes an `Args` value,
   checked fully. The argument-less `enqueue(repo)` a job with `job_args`
-  inherits raises `ArgumentError`.
+  inherits raises [ArgumentError].
 - `unique` keeps one live job (scheduled, available, running, or failed
   with a retry pending) per class, values of the `by` arguments (fields
   without a default), and `period` (by the database's clock); `enqueue`
-  gives the live one's `Enqueued` instead of inserting. Under REPEATABLE
+  gives the live one's [Divider::Enqueued] instead of inserting. Under REPEATABLE
   READ or SERIALIZABLE it may raise a serialization failure: retry the
   transaction.
-- `perform` returning ends the job `completed`; `Divider::Discard` discards
+- `perform` returning ends the job `completed`; [Divider::Discard] discards
   it; `Divider::Snooze.new(10.minutes)` puts it off without counting the
   attempt; any other exception, or the `timeout`, fails the attempt,
   recorded in the row's `errors` and retried after `attempt ** 4 + 15`
   seconds plus up to 30 (or what the job's `def self.retry_in(attempt:
   Int, error: Exception) -> Duration` says), until `max_attempts`, then
   discarded.
-- `Divider.cancel` cancels a scheduled, available or failed job; a running
+- [Divider.cancel] cancels a scheduled, available or failed job; a running
   one is asked to stop: it sees `job.cancel_requested?` and raises
-  `Divider::Cancelled` (the job ends `cancelled`), or finishes anyway
+  [Divider::Cancelled] (the job ends `cancelled`), or finishes anyway
   (`completed`, the request kept in `cancelled_at`).
 
 ## Running jobs
@@ -122,7 +122,7 @@ worker.run      # or Task.spawn { worker.run } beside an HTTP server
 - `shutdown(grace)` stops fetching and gives the running jobs `grace` to
   finish; those still running are cancelled and go back to `available`,
   the attempt not counted (or to `cancelled`, when that was asked). A
-  second `shutdown` (a second Ctrl-C to `Divider.serve`) cancels them at
+  second `shutdown` (a second Ctrl-C to [Divider.serve]) cancels them at
   once.
 - Every 30 seconds a worker marks its running jobs alive; one worker at a
   time (an advisory lock) gives back the running jobs of a worker silent
@@ -133,8 +133,8 @@ worker.run      # or Task.spawn { worker.run } beside an HTTP server
   others: every worker running a queue should know all of that queue's
   classes, and queues are how work is split between workers of different
   kinds. A row whose class no deploy knows any more stays `available`
-  until `Divider.cancel` removes it.
-- `on_error:` and `on_event:` (`Divider::Event`: started, completed,
+  until [Divider.cancel] removes it.
+- `on_error:` and `on_event:` ([Divider::Event]: started, completed,
   failed, discarded, snoozed, cancelled, rescued, with durations) receive
   what happens; without `on_error`, errors are printed to standard error.
 - Each worker's `node` must differ from the others' running at the same
@@ -182,12 +182,12 @@ class SignupTest < Test::Case
 end
 ```
 
-- `fake` records enqueues (`Divider::Testing.enqueued`) instead of
+- `fake` records enqueues ([Divider::Testing.enqueued]) instead of
   inserting them.
 - `inline(repo)` runs each job as it is enqueued, in the test's task; one
   enqueued in a transaction runs at the next enqueue outside one, or when
   the block ends (a rolled-back one never). Jobs run as a worker runs them:
-  a `Snooze` leaves the job scheduled. A job enqueued `at:` or `after:` a
+  a [Divider::Snooze] leaves the job scheduled. A job enqueued `at:` or `after:` a
   time runs at once too; a unique enqueue that gives back a live job runs
   nothing.
 - Under `fake`, `unique` is not applied: each enqueue is recorded.
@@ -197,7 +197,7 @@ end
 
 ## In a bezel application
 
-- Add `Divider::Migrations.all` to the migrations `Bezel.main` runs:
+- Add [Divider::Migrations.all] to the migrations `Bezel.main` runs:
   `migrations: Shop::Migrations.all + Divider::Migrations.all` in
   `src/main.qz`, so that `bezel migrate` creates the tables.
 - Run the worker beside the endpoint, in the web process

@@ -31,7 +31,7 @@ class Cron
 
   @entries: Array[Entry]
 
-  # A schedule of `entries`.
+  # A schedule of [entries].
   def initialize(@entries: Array[Entry])
   end
 
@@ -41,7 +41,7 @@ class Cron
   # An entry: `job` enqueued, with `args` (its arguments as keywords,
   # JSON-encoded now; checked when the job is decoded), at each minute
   # `expression` matches, and with `run_on_start`, also at a worker's
-  # first check. `ArgumentError` for an expression that does not parse.
+  # first check. [ArgumentError] for an expression that does not parse.
   #
   # ```quarz no_run
   # Divider::Cron.entry("0 * * * *", Divider::Job, run_on_start: true)
@@ -104,7 +104,7 @@ class Cron
           "ON CONFLICT (key) DO UPDATE SET last_minute = EXCLUDED.last_minute " +
           "WHERE divider_cron.last_minute < EXCLUDED.last_minute RETURNING key"
 
-  # The schedule of `expression`; `ArgumentError` when it does not parse.
+  # The schedule of `expression`; [ArgumentError] when it does not parse.
   def self.parse(expression: String) -> Schedule
     text = MACROS[expression.strip.downcase]? || expression
     fields = text.strip.split(/\s+/)
@@ -172,11 +172,11 @@ class Cron
             "JUL" => 7, "AUG" => 8, "SEP" => 9, "OCT" => 10, "NOV" => 11, "DEC" => 12}
   WDAYS = {"SUN" => 0, "MON" => 1, "TUE" => 2, "WED" => 3, "THU" => 4, "FRI" => 5, "SAT" => 6}
 
-  # A cron entry (`Cron.entry`).
+  # A cron entry ([Cron.entry]).
   data Entry = (expression: String, job: Type[Job], args: String, schedule: Schedule, run_on_start: Bool = false)
 
   # The minutes, hours, days, months and days of the week an expression
-  # matches; `any_day`/`any_wday` when those fields started with `*`.
+  # matches; [any_day]/[any_wday] when those fields started with `*`.
   data Schedule(minutes: Set[Int], hours: Set[Int], days: Set[Int], months: Set[Int], wdays: Set[Int],
                 any_day: Bool, any_wday: Bool)
     # Whether the minute of `t` (UTC) matches.
