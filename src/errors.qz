@@ -1,4 +1,4 @@
-# What divider raises (beside `ArgumentError` for a wrong argument).
+# What divider raises (beside [ArgumentError] for a wrong argument).
 class Error < StandardError
 end
 
@@ -13,7 +13,7 @@ end
 class Discard < Error
 end
 
-# Raised by a job's `perform` to run it again after `delay`, without
+# Raised by a job's `perform` to run it again after [delay], without
 # counting the attempt.
 class Snooze < Error
   @delay: Duration

@@ -1,7 +1,7 @@
 # What a running job's `perform` is told of its attempt, and its
-# repository: `repo` is a `Rotor::Repo` over the worker's pool, made for
+# repository: [repo] is a [Rotor::Repo] over the worker's pool, made for
 # this attempt (each statement takes a connection; a transaction holds
-# one), or the test's repository under `Divider::Testing`.
+# one), or the test's repository under [Divider::Testing].
 #
 # ```quarz no_run
 # class PurgeSessions < Divider::Job
@@ -42,8 +42,8 @@ class Context
   # A repository over the worker's pool.
   def repo -> Rotor::Repo = @repo
 
-  # Whether `Divider.cancel` asked the job to stop (a query): a long job
-  # polls it, and raises `Divider::Cancelled` to stop, which ends it
+  # Whether [Divider.cancel] asked the job to stop (a query): a long job
+  # polls it, and raises [Divider::Cancelled] to stop, which ends it
   # `cancelled` (returning instead ends it `completed`).
   def cancel_requested? -> Bool = Context.cancel_requested?(@repo, @id)
 

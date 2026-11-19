@@ -23,7 +23,7 @@
 abstract class Job
   # Runs the job: what a job without `job_args` defines, with what the worker
   # tells of the attempt (`job.repo` for its queries). Returning ends the
-  # job `completed`; `Divider::Discard` discards it, `Divider::Snooze`
+  # job `completed`; [Divider::Discard] discards it, [Divider::Snooze]
   # puts it off, any other exception fails the attempt.
   def perform(job: Context) -> Void
     raise NotImplementedError.new("#{self.class.name} defines no `perform(job: Divider::Context)`")
@@ -116,19 +116,19 @@ abstract class Job
   #   also when two values of one call have the same key; an empty array
   #   inserts nothing. The queue is notified once.
   #
-  # A field's class is checked here: `Int`, `Integer`, `Float`,
-  # `String`, `Bool`, `Symbol`, `Time`, `Bytes`, `Array`, `Hash`, `Set`,
+  # A field's class is checked here: [Int], [Integer], [Float],
+  # [String], [Bool], [Symbol], [Time], [Bytes], [Array], [Hash], [Set],
   # another `data` type of such fields, or a nullable or union one
-  # (which `Type#fields` shows as `Object`). Only the outer class is
+  # (which [Type#fields] shows as [Object]). Only the outer class is
   # checked here: a nullable or union field and the elements of a
   # collection are not (`Pen?` or `Array[Pen]` passes, and is found when
   # the worker decodes the job). The keywords are typed by the fields'
-  # declared types in full (`Meta::Field#type_ref`: `ids: Array[Int]`,
-  # `note: String?`), and `enqueue_all`'s `args:` as an `Array` of the
+  # declared types in full ([Meta::Field#type_ref]: `ids: Array[Int]`,
+  # `note: String?`), and `enqueue_all`'s `args:` as an [Array] of the
   # type, so a call with a value of another type does not compile. The
-  # worker decodes the stored arguments (`JSON.decode`) and
+  # worker decodes the stored arguments ([JSON.decode]) and
   # calls `perform(args, job)`; arguments that do not decode discard the
-  # job with `Divider::ArgsError`, which names where. A field cannot be
+  # job with [Divider::ArgsError], which names where. A field cannot be
   # named `repo`, `at`, `after` or `priority`, and `job_args` comes once.
   static def self.job_args[A](type: Type[A]) -> Void
     perform = method_ref[(A, Context) -> Void](:perform)
@@ -247,7 +247,7 @@ abstract class Job
   # At most one live job (scheduled, available, running, or failed with
   # a retry pending) of the class with the same values of the arguments
   # `by` within each `period` (from the epoch, by the database's clock),
-  # or ever without one: `enqueue` gives the existing job's `Enqueued`
+  # or ever without one: `enqueue` gives the existing job's [Enqueued]
   # instead of inserting. Under REPEATABLE READ or SERIALIZABLE, an
   # `enqueue` whose key a transaction committed since the snapshot holds
   # raises PostgreSQL's serialization failure instead: retry the
@@ -277,7 +277,7 @@ abstract class Job
   # For a job without arguments: one with `job_args` takes them as keywords
   # (`enqueue(repo: repo, user_id: 42)`), and calling this form on it
   # (which `enqueue(repo: repo)` without its arguments also resolves to)
-  # raises `ArgumentError`.
+  # raises [ArgumentError].
   def self.enqueue(repo: Rotor::Repo, *, at: Time? = nil, after: Duration? = nil, priority: Int = 5) -> Enqueued
     if t = job_args_type
       raise ArgumentError.new("#{name}.enqueue takes its arguments (#{t.name}) as keywords, or a #{t.name} value with enqueue_args")

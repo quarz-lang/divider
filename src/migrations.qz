@@ -1,5 +1,5 @@
-# The schema of the queue, as rotor migrations (`Rotor::Migration`): an
-# application adds `Divider::Migrations.all` to its migrator's list.
+# The schema of the queue, as rotor migrations ([Rotor::Migration]): an
+# application adds [Divider::Migrations.all] to its migrator's list.
 #
 # ```quarz no_run
 # def migrate(repo: Rotor::Repo, app: Array[Type[Rotor::Migration]]) -> Void
@@ -19,7 +19,7 @@ end
 # insertion until it is pruned. States: `scheduled`, `available`,
 # `running`, `completed`, `failed` (a retry pending, at `scheduled_at`),
 # `discarded`, `cancelled`. A running job whose `cancelled_at` is set
-# was asked to stop (`Divider.cancel`).
+# was asked to stop ([Divider.cancel]).
 class Migrations::CreateJobs < Rotor::Migration
   version 20261108000001
 
