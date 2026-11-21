@@ -674,4 +674,15 @@ class WorkerTest < Test::Case
     assert_raise(ArgumentError) { Divider::Worker.new("postgres://x@localhost/x", jobs: [WtCount, WtCount]) }
     assert_raise(ArgumentError) { Divider::Worker.new("postgres://x@localhost/x", jobs: [WtCount], queues: {"a-b": 1}) }
   end
+
+  # divider#36: the worker's inspect shows where the database is, not its
+  # URL's password.
+  def test_inspect_hides_the_password
+    w = Divider::Worker.new("postgres://app:hunter2@db.example:5433/jobs", jobs: [WtCount], node: "n1", queues: {default: 2})
+    [w.inspect, [w].inspect].each do |text|
+      assert_false(text.include?("hunter2"), text)
+    end
+    assert_equal("#<Divider::Worker node: \"n1\", queues: {\"default\" => 2}, database: \"db.example:5433/jobs\">", w.inspect)
+    assert_false(w.to_s.include?("hunter2"))
+  end
 end

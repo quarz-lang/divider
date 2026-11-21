@@ -116,6 +116,14 @@ class Worker
   # This process's name in the rows it runs.
   def node -> String = @node
 
+  # The worker without its database URL, which holds the password: the
+  # node, the queues and where the database is (host, port, database).
+  def inspect -> String
+    c = PG.parse_url(@url)
+    "#<Divider::Worker node: #{@node.inspect}, queues: #{@queues.inspect}, " +
+      "database: #{"#{c.host}:#{c.port}/#{c.database || c.user}".inspect}>"
+  end
+
   # Runs the queues until [shutdown], then closes the worker's
   # connections. A worker runs once.
   def run -> Void
