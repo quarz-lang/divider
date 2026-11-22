@@ -118,7 +118,7 @@ end
 
 # An `initialize` that takes no argument but requires a block: `new`'s
 # signatures cannot tell it, so it writes `needs_factory` (without it,
-# `new_job` would call `new` without a block: quarz-lang/quarz#1065).
+# the checker refuses it: test/fixtures/bad_jobs).
 class FtBlockInit < Divider::Job
   needs_factory
   @tag: String

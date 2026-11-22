@@ -39,9 +39,9 @@ abstract class Job
   # called without arguments: [inherited] declares it for such a class.
   # Kept for the bodies that have it, and needed by a job whose only
   # `initialize`s that take no arguments require a block (which
-  # [Type#constructors] cannot tell): without it, `new` makes it without
-  # a block, which fails the attempt. A worker (and
-  # `Divider::Testing.drain`) given the class in `jobs:` without its
+  # [Type#constructors] cannot tell): without it, the checker refuses such
+  # an `initialize`, as `new_job` calls `new` without a block. A worker
+  # (and `Divider::Testing.drain`) given the class in `jobs:` without its
   # factory raises [ArgumentError] when it is made. `Job` makes the other
   # jobs with `new` in a class method they inherit, which the language
   # allows only for a subclass whose `new` takes no argument, or that

@@ -174,9 +174,9 @@ worker = Divider::Worker.new(ENV["DATABASE_URL"], jobs: [Cleanup, Deliver],
 - `needs_factory` is unnecessary for such a class, and still accepted.
   A job writes it when its `initialize` takes no argument but requires
   a block, which the hook cannot tell from one taking nothing (the
-  block is not among the constructor's parameters). Without it, such a
-  job is made with `new` and no block, which fails each attempt (the
-  checker does not refuse it yet: quarz-lang/quarz#1065). A job whose
+  block is not among the constructor's parameters). Without it, the
+  checker refuses such a job's `initialize`: it does not take the
+  arguments of `new` in `Divider::Job.new_job` (no block). A job whose
   `new` takes no argument may also write it to be made by a factory
   only.
 - `Divider.factory(Deliver) { ... }` must give a `Deliver`: a block giving
