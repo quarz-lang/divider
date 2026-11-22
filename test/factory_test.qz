@@ -1,0 +1,352 @@
+require "test"
+
+# What the factories give the jobs: a tag, noted with the job's run, and
+# a count of the instances made.
+class FtDeps
+  include Shareable
+
+  @tag: String
+  @made: Atom[Int]
+
+  def initialize(@tag: String, @made: Atom[Int])
+  end
+
+  def tag -> String = @tag
+  def made -> Atom[Int] = @made
+end
+
+# Notes its run with its factory's tag.
+class FtTagged < Divider::Job
+  needs_factory
+  @deps: FtDeps
+
+  def initialize(@deps: FtDeps)
+  end
+
+  def perform(job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO ft_runs (job_id, attempt, tag) VALUES ($1, $2, $3)", [job.id, job.attempt, @deps.tag])
+  end
+end
+
+# Fails its first attempt, retried at once.
+class FtFlaky < Divider::Job
+  max_attempts 2
+  needs_factory
+
+  @deps: FtDeps
+
+  def initialize(@deps: FtDeps)
+  end
+
+  def self.retry_in(attempt: Int, error: Exception) -> Duration = 0.seconds
+
+  def perform(job: Divider::Context) -> Void
+    raise ArgumentError.new("first") if job.attempt == 1
+    job.repo.exec("INSERT INTO ft_runs (job_id, attempt, tag) VALUES ($1, $2, $3)", [job.id, job.attempt, @deps.tag])
+  end
+end
+
+# Subclasses of a job that `needs_factory`: inheriting it, and declaring
+# it again.
+class FtTaggedSub < FtTagged
+end
+
+class FtTaggedAgain < FtTagged
+  needs_factory
+end
+
+# Made with `new` or, given one, by a factory, which tags it.
+class FtOptional < Divider::Job
+  @tag: String
+
+  def initialize(@tag: String = "new")
+  end
+
+  def perform(job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO ft_runs (job_id, attempt, tag) VALUES ($1, $2, $3)", [job.id, job.attempt, @tag])
+  end
+end
+
+# Without a factory: made with `new`.
+class FtPlain < Divider::Job
+  def perform(job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO ft_runs (job_id, attempt, tag) VALUES ($1, $2, 'new')", [job.id, job.attempt])
+  end
+end
+
+# Its factory raises; FtPerformRaises's `perform` does: the same outcome.
+class FtFactoryRaises < Divider::Job
+  max_attempts 2
+
+  def self.retry_in(attempt: Int, error: Exception) -> Duration = 0.seconds
+
+  def perform(job: Divider::Context) -> Void
+  end
+end
+
+class FtPerformRaises < Divider::Job
+  max_attempts 2
+
+  def self.retry_in(attempt: Int, error: Exception) -> Duration = 0.seconds
+
+  def perform(job: Divider::Context) -> Void
+    raise ArgumentError.new("boom")
+  end
+end
+
+# Its factory makes a subclass's instance.
+class FtBase < Divider::Job
+  max_attempts 1
+
+  def perform(job: Divider::Context) -> Void
+  end
+end
+
+class FtSub < FtBase
+end
+
+# Its factory takes longer than the timeout, or waits for the shutdown.
+class FtTimed < Divider::Job
+  timeout 100.ms
+  max_attempts 1
+
+  def perform(job: Divider::Context) -> Void
+  end
+end
+
+class FtBlocked < Divider::Job
+  def perform(job: Divider::Context) -> Void
+  end
+end
+
+# Workers given factories ([Divider.factory]) against a server
+# (`PG::Testing`).
+class FactoryTest < Test::Case
+  ALL = [FtTagged, FtTaggedSub, FtTaggedAgain, FtOptional, FtFlaky, FtPlain, FtFactoryRaises, FtPerformRaises, FtBase, FtTimed, FtBlocked]
+
+  def with_repo(&: (Rotor::Repo, String) -> Void) -> Void
+    PG::Testing.with_cluster do |url|
+      PG::Pool.open(url, 2) do |pool|
+        repo = Rotor::Repo.new(pool: pool)
+        FactoryTest.reset(repo)
+        begin
+          Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_ft_versions").migrate
+          repo.exec("CREATE TABLE ft_runs (job_id bigint, attempt int NOT NULL, tag text NOT NULL, PRIMARY KEY (job_id, attempt))")
+          yield repo, url
+        ensure
+          FactoryTest.reset(repo)
+        end
+      end
+    end
+  rescue PG::Testing::Unavailable => e
+    omit(e.message)
+  end
+
+  def self.reset(repo: Rotor::Repo) -> Void
+    repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_ft_versions, ft_runs")
+  end
+
+  # The factories of FtTagged and FtFlaky, tagged `tag`, counting in `made`.
+  def tagged(tag: String, made: Atom[Int]) -> Array[Divider::Factory]
+    deps = FtDeps.new(tag, made)
+    [Divider.factory(FtTagged) do
+       made.update { |n| n + 1 }
+       FtTagged.new(deps)
+     end,
+     Divider.factory(FtTaggedSub) { FtTaggedSub.new(deps) },
+     Divider.factory(FtTaggedAgain) { FtTaggedAgain.new(deps) },
+     Divider.factory(FtFlaky) do
+       made.update { |n| n + 1 }
+       FtFlaky.new(deps)
+     end]
+  end
+
+  def worker(url: String, factories: Array[Divider::Factory], *, node: String = "test-node",
+             events: Channel[String]? = nil, errors: Channel[String]? = nil) -> Divider::Worker
+    # (The classes that need a factory only when the test gives one.)
+    jobs = ALL.select { |c| !c.job_needs_factory || factories.any? { |f| f.job == c } }
+    Divider::Worker.new(url, jobs: jobs, queues: {default: 3}, poll: 50.ms, node: node, factories: factories,
+                        on_error: ->(e: Exception, c: Divider::Context) { errors&.try_send("#{c.class_name} #{c.attempt} #{e.class.name}: #{e.message}"); nil },
+                        on_event: ->(ev: Divider::Event) { events&.try_send("#{ev.class_name} #{ev.attempt} #{ev.kind}"); nil })
+  end
+
+  def run_until(w: Divider::Worker, grace: Duration? = 5.seconds, &done: () -> Bool) -> Void
+    t = Task.spawn { w.run }
+    begin
+      400.times do
+        break if yield
+        Task.sleep(50.ms)
+      end
+    ensure
+      w.shutdown(grace)
+      t.await
+    end
+  end
+
+  def state(repo: Rotor::Repo, id: Int) -> String = repo.query("SELECT state FROM divider_jobs WHERE id = $1", [id]) { |r| r.string(0) }[0]
+
+  def error_of(repo: Rotor::Repo, id: Int, nth: Int) -> String
+    repo.query("SELECT (errors->#{nth}->>'attempt') || ' ' || (errors->#{nth}->>'error') || ': ' || (errors->#{nth}->>'message') FROM divider_jobs WHERE id = $1",
+               [id]) { |r| r.string(0) }[0]
+  end
+
+  def drained(ch: Channel[String]) -> Array[String]
+    got: Array[String] = []
+    while (m = ch.try_receive)
+      got = got.push(m)
+    end
+    got
+  end
+
+  def test_a_factory_s_instance_runs_once_per_attempt
+    with_repo do |repo, url|
+      made = Atom[Int].new(0)
+      tagged = FtTagged.enqueue(repo)
+      flaky = FtFlaky.enqueue(repo)
+      plain = FtPlain.enqueue(repo)
+      sub = FtTaggedSub.enqueue(repo)
+      again = FtTaggedAgain.enqueue(repo)
+      optional = FtOptional.enqueue(repo)
+      jobs = [tagged, flaky, plain, sub, again, optional]
+      # (A factory for FtOptional, which does not need one: it is used.)
+      w = worker(url, tagged("given", made) + [Divider.factory(FtOptional) { FtOptional.new("optional") }])
+      run_until(w) { jobs.all? { |j| state(repo, j.id) == "completed" } }
+      assert_equal(jobs.map { |_| "completed" }, jobs.map { |j| state(repo, j.id) })
+      runs = repo.query("SELECT job_id, attempt, tag FROM ft_runs ORDER BY job_id") { |r| "#{r.int(0)} #{r.int(1)} #{r.string(2)}" }
+      assert_equal(["#{tagged.id} 1 given", "#{flaky.id} 2 given", "#{plain.id} 1 new", "#{sub.id} 1 given", "#{again.id} 1 given",
+                    "#{optional.id} 1 optional"], runs)
+      # FtTagged once, FtFlaky for each of its two attempts.
+      assert_equal(3, made.get)
+    end
+  end
+
+  # A factory that raises fails the attempt as a `perform` that raises
+  # does: the row's error, `on_error`, the events, the retry, the discard.
+  def test_a_raising_factory_fails_the_attempt_as_perform_does
+    with_repo do |repo, url|
+      by_factory = FtFactoryRaises.enqueue(repo)
+      by_perform = FtPerformRaises.enqueue(repo)
+      events = Channel[String].new(20)
+      errors = Channel[String].new(20)
+      raising = Divider.factory(FtFactoryRaises) do -> FtFactoryRaises
+        raise ArgumentError.new("boom")
+      end
+      w = worker(url, [raising], events: events, errors: errors)
+      run_until(w) { state(repo, by_factory.id) == "discarded" && state(repo, by_perform.id) == "discarded" }
+      assert_equal(["discarded", "discarded"], [state(repo, by_factory.id), state(repo, by_perform.id)])
+      [0, 1].each do |i|
+        assert_equal(error_of(repo, by_perform.id, i), error_of(repo, by_factory.id, i))
+        assert_equal("#{i + 1} ArgumentError: boom", error_of(repo, by_factory.id, i))
+      end
+      seen_events = drained(events)
+      seen_errors = drained(errors)
+      ["FtFactoryRaises", "FtPerformRaises"].each do |c|
+        assert_equal(["#{c} 1 started", "#{c} 1 failed", "#{c} 2 started", "#{c} 2 discarded"], seen_events.select { |e| e.start_with?("#{c} ") })
+        assert_equal(["#{c} 1 ArgumentError: boom", "#{c} 2 ArgumentError: boom"], seen_errors.select { |e| e.start_with?("#{c} ") })
+      end
+    end
+  end
+
+  def test_an_instance_of_another_class_fails_the_attempt
+    with_repo do |repo, url|
+      job = FtBase.enqueue(repo)
+      w = worker(url, [Divider.factory(FtBase) { FtSub.new }])
+      run_until(w) { state(repo, job.id) == "discarded" }
+      assert_equal("discarded", state(repo, job.id))
+      assert_equal("1 ArgumentError: the factory of FtBase made a FtSub: it must make a FtBase itself, not another class",
+                   error_of(repo, job.id, 0))
+    end
+  end
+
+  def test_a_factory_counts_toward_the_timeout
+    with_repo do |repo, url|
+      job = FtTimed.enqueue(repo)
+      slow = Divider.factory(FtTimed) do
+        Task.sleep(5.seconds)
+        FtTimed.new
+      end
+      run_until(worker(url, [slow])) { state(repo, job.id) == "discarded" }
+      assert_equal("discarded", state(repo, job.id))
+      assert_equal("Task::Timeout", repo.query("SELECT errors->0->>'error' FROM divider_jobs WHERE id = $1", [job.id]) { |r| r.string(0) }[0])
+    end
+  end
+
+  # A factory still running at the shutdown's end is cancelled as a
+  # `perform` is: the row back to `available`, the attempt not counted.
+  def test_shutdown_cancels_a_factory
+    with_repo do |repo, url|
+      job = FtBlocked.enqueue(repo)
+      started = Channel[Nil].new(1)
+      blocked = Divider.factory(FtBlocked) do
+        started.try_send(nil)
+        Task.sleep(30.seconds)
+        FtBlocked.new
+      end
+      w = worker(url, [blocked])
+      t = Task.spawn { w.run }
+      began = Time.now
+      begin
+        started.receive
+      ensure
+        w.shutdown(100.ms)
+        t.await
+      end
+      assert_true(Time.now - began < 10.seconds)
+      assert_equal(["available", 0], repo.query("SELECT state, attempt FROM divider_jobs WHERE id = $1", [job.id]) { |r| [r.string(0), r.int(1)] }[0])
+    end
+  end
+
+  # Two workers of one process, each with its own factory for the same
+  # class: each job ran with the factory of the worker that ran it.
+  def test_two_workers_with_their_own_factories
+    with_repo do |repo, url|
+      ids = (1..20).map { |_| FtTagged.enqueue(repo).id }
+      made = Atom[Int].new(0)
+      a = worker(url, tagged("a", made), node: "a")
+      b = worker(url, tagged("b", made), node: "b")
+      ta = Task.spawn { a.run }
+      tb = Task.spawn { b.run }
+      begin
+        400.times do
+          break if repo.query("SELECT count(*) FROM ft_runs") { |r| r.int(0) }[0] == 20
+          Task.sleep(50.ms)
+        end
+      ensure
+        a.shutdown
+        b.shutdown
+        ta.await
+        tb.await
+      end
+      assert_equal(ids.sort, repo.query("SELECT job_id FROM ft_runs ORDER BY job_id") { |r| r.int(0) })
+      assert_equal(0, repo.query("SELECT count(*) FROM ft_runs f JOIN divider_jobs d ON d.id = f.job_id WHERE f.tag <> d.node") { |r| r.int(0) }[0])
+      assert_equal(20, made.get)
+    end
+  end
+
+  def test_factories_are_checked_at_new
+    made = Atom[Int].new(0)
+    url = "postgres://localhost/none"
+    e = assert_raise(ArgumentError) { Divider::Worker.new(url, jobs: [FtPlain], factories: tagged("x", made)) }
+    assert_equal("a factory is given for FtTagged, which is not in jobs", e.message)
+    twice = [Divider.factory(FtPlain) { FtPlain.new }, Divider.factory(FtPlain) { FtPlain.new }]
+    e = assert_raise(ArgumentError) { Divider::Worker.new(url, jobs: [FtPlain], factories: twice) }
+    assert_equal("FtPlain is given two factories", e.message)
+    e = assert_raise(ArgumentError) { Divider.serve(url, jobs: [FtPlain], factories: twice) }
+    assert_equal("FtPlain is given two factories", e.message)
+    e = assert_raise(ArgumentError) { Divider.serve(url, jobs: [FtPlain], factories: tagged("x", made)) }
+    assert_equal("a factory is given for FtTagged, which is not in jobs", e.message)
+    assert_equal("#<Divider::Factory FtPlain>", twice[0].inspect)
+    # A class that needs a factory, without one: refused at the start,
+    # a subclass inheriting the declaration too.
+    e = assert_raise(ArgumentError) { Divider::Worker.new(url, jobs: [FtPlain, FtTagged]) }
+    assert_equal("FtTagged needs a factory (it declares `needs_factory`): pass Divider.factory(FtTagged) { ... } in factories:", e.message)
+    e = assert_raise(ArgumentError) { Divider.serve(url, jobs: [FtTagged]) }
+    assert_equal("FtTagged needs a factory (it declares `needs_factory`): pass Divider.factory(FtTagged) { ... } in factories:", e.message)
+    only_parent = tagged("x", made).select { |f| f.job == FtTagged }
+    e = assert_raise(ArgumentError) { Divider::Worker.new(url, jobs: [FtTagged, FtTaggedSub], factories: only_parent) }
+    assert_equal("FtTaggedSub needs a factory (it declares `needs_factory`): pass Divider.factory(FtTaggedSub) { ... } in factories:", e.message)
+    assert_true(FtTaggedSub.job_needs_factory)
+    assert_false(FtOptional.job_needs_factory)
+    assert_equal(0, made.get)
+  end
+end

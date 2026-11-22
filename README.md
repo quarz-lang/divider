@@ -140,6 +140,57 @@ worker.run      # or Task.spawn { worker.run } beside an HTTP server
 - Each worker's `node` must differ from the others' running at the same
   time (the default adds a random suffix to `HOSTNAME` and the pid).
 
+### Jobs that need something from the application
+
+A job takes what it needs (a client, a cache) in its own `initialize`
+and declares `needs_factory`, and the worker is given a factory for its
+class, which it calls for each attempt instead of `new`:
+
+```crystal
+class Deliver < Divider::Job
+  needs_factory
+
+  @client: HTTP::Client
+
+  def initialize(@client: HTTP::Client)
+  end
+
+  def perform(job: Divider::Context) -> Void
+    @client.get("https://example.com/ping")
+  end
+end
+
+client = HTTP::Client.new
+worker = Divider::Worker.new(ENV["DATABASE_URL"], jobs: [Cleanup, Deliver],
+                             factories: [Divider.factory(Deliver) { Deliver.new(client) }])
+```
+
+- `needs_factory` is needed because a job is otherwise made with `new` in
+  a class method it inherits from `Divider::Job`, which Quarz allows only
+  for a class whose `initialize` takes no argument (or that overrides the
+  method, as the statement does). Without it, the class does not compile:
+  the checker says that `Deliver#initialize` does not take the arguments
+  of `new` in `Divider::Job.new_job`, which `Deliver` inherits. A worker
+  (or `Testing.drain`) given such a class without its factory raises
+  `ArgumentError` at once ("Deliver needs a factory (it declares
+  needs_factory): pass Divider.factory(Deliver) { ... } in factories:").
+  A subclass inherits the declaration.
+- `Divider.factory(Deliver) { ... }` must give a `Deliver`: a block giving
+  another class does not compile, and an instance of a subclass fails the
+  attempt. A class without a factory is made with `new`; one that
+  does not declare `needs_factory` may be given a factory too. A factory
+  is for a class in `jobs:`, one per class (`ArgumentError` otherwise).
+- The factory is called once per attempt, in the attempt's task: inside
+  the job's `timeout`, stopped by `shutdown` as `perform` is. One that
+  raises fails the attempt as a raising `perform` does.
+- Attempts run in tasks of their own, so the block is `shareable`: what
+  it captures must be Shareable, and every attempt shares it, several at
+  once (an `HTTP::Client` is Shareable; a value the attempts update goes
+  in an `Atom`). A `Rotor::Repo` is not Shareable and cannot be captured:
+  a job queries through `job.repo`.
+- `Divider.serve` and `Divider::Testing.inline`/`drain` take the same
+  `factories:` (see Testing).
+
 ## Recurring jobs
 
 ```crystal
@@ -192,6 +243,11 @@ end
   nothing.
 - Under `fake`, `unique` is not applied: each enqueue is recorded.
 - `drain(repo, jobs:)` runs the jobs of those classes due now, once.
+- `inline(repo, factories: [...])` and `drain(repo, jobs:, factories: [...])`
+  make the jobs with the factories given, as a worker does: a test gives
+  its doubles (`Divider.factory(Deliver) { Deliver.new(FakeClient.new) }`).
+  `inline`'s are kept with the rest of its process-wide state until its
+  block ends; tests that run at once give theirs to `drain`.
 - `fake` and `inline` set a mode for the whole process: they are not for
   tests run in parallel (`quarz test --parallel`).
 

@@ -33,6 +33,12 @@
 # class no deploy knows any more stays `available` until [Divider.cancel]
 # removes it.
 #
+# A job class that needs something from the application (a client, a
+# cache) takes it in its `initialize`, and the worker is given its
+# factory ([Divider.factory]), which it calls for each attempt of that
+# class instead of `new` (`factories: [Divider.factory(Deliver) {
+# Deliver.new(client) }]`; the rules are [Divider.factory]'s).
+#
 # An attempt that returns ends the job `completed`. One that raises
 # [Divider::Discard] discards it; [Divider::Snooze] puts it off without
 # counting the attempt; [Divider::Cancelled], or an exception after
@@ -59,6 +65,8 @@ class Worker
   @on_error: (shareable (Exception, Context) -> Void)?
   @on_event: (shareable (Event) -> Void)?
   @cron: Cron?
+  # The factories of the job classes that have one, by name.
+  @factories: Hash[String, Factory]
   # Closed by `shutdown`: the dispatchers stop fetching.
   @stop: Channel[Nil]
   # Closed by a second `shutdown`: the running jobs are cancelled at once.
@@ -76,13 +84,16 @@ class Worker
   # pool (10 by default; see above). [node] names this process in
   # the rows it runs (by default
   # `HOSTNAME-pid-` and a random suffix): it must differ from every other
-  # running worker's.
+  # running worker's. `factories` make the instances of the classes that
+  # need something from the application ([Divider.factory]): one per class
+  # at most, of a class in `jobs`; the others are made with `new`.
   def initialize(@url: String, *, jobs: Array[Type[Job]], queues: Hash[Symbol, Int] = {default: 10},
                  pool_size: Int? = nil, @poll: Duration = 1.second, node: String? = nil,
                  @heartbeat: Duration = 30.seconds, @stale_after: Duration = 5.minutes,
                  @keep_completed: Duration = 7.days, @keep_discarded: Duration = 30.days,
                  @on_error: (shareable (Exception, Context) -> Void)? = nil,
-                 @on_event: (shareable (Event) -> Void)? = nil, @cron: Cron? = nil)
+                 @on_event: (shareable (Event) -> Void)? = nil, @cron: Cron? = nil,
+                 factories: Array[Factory] = [])
     raise ArgumentError.new("a worker runs at least one queue") if queues.empty?
     raise ArgumentError.new("a worker runs at least one job class") if jobs.empty?
     by_name: Hash[String, Type[Job]] = {}
@@ -91,6 +102,7 @@ class Worker
       by_name = by_name.put(j.name, j)
     end
     @jobs = by_name
+    @factories = Factory.index(factories, by_name)
     qs: Hash[String, Int] = {}
     queues.each_pair do |q, n|
       raise ArgumentError.new("a queue's name is letters, digits and _, not #{q.to_s.inspect}") unless q.to_s.match?(/\A[A-Za-z0-9_]{1,64}\z/)
@@ -347,7 +359,7 @@ class Worker
   # is not Shareable).
   def runner -> Runner
     Runner.new(Rotor::Repo.new(pool: @own), @jobs, @node, @keep_completed.to_ms, @on_error, @on_event,
-               job_repo: Rotor::Repo.new(pool: @pool))
+               job_repo: Rotor::Repo.new(pool: @pool), factories: @factories)
   end
 
   # :nodoc:
@@ -561,8 +573,10 @@ data Event = (kind: Symbol, id: Int, class_name: String, queue: String, attempt:
 public def serve(url: String, *, jobs: Array[Type[Job]], queues: Hash[Symbol, Int] = {default: 10},
                  grace: Duration = 25.seconds, node: String? = nil, poll: Duration = 1.second,
                  on_error: (shareable (Exception, Context) -> Void)? = nil,
-                 on_event: (shareable (Event) -> Void)? = nil, cron: Cron? = nil) -> Void
-  worker = Worker.new(url, jobs: jobs, queues: queues, node: node, poll: poll, on_error: on_error, on_event: on_event, cron: cron)
+                 on_event: (shareable (Event) -> Void)? = nil, cron: Cron? = nil,
+                 factories: Array[Factory] = []) -> Void
+  worker = Worker.new(url, jobs: jobs, queues: queues, node: node, poll: poll, on_error: on_error, on_event: on_event, cron: cron,
+                      factories: factories)
   Signal.trap(:TERM) { worker.shutdown(grace) }
   Signal.trap(:INT) { worker.shutdown(grace) }
   worker.run

@@ -101,3 +101,13 @@ class GoodBase2 < Divider::Job
   def perform(args: TypedArgs, job: Divider::Context) -> Void
   end
 end
+
+# A factory whose block gives another job class (divider#38).
+def factories -> Array[Divider::Factory]
+  [Divider.factory(Fine) { NoPerform.new }]
+end
+
+class NeedsTwice < Divider::Job
+  needs_factory
+  needs_factory
+end

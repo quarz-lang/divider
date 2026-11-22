@@ -39,6 +39,19 @@ class TtBatch < Divider::Job
   end
 end
 
+# Notes its run with its factory's tag (a test's double).
+class TtTagged < Divider::Job
+  needs_factory
+  @tag: String
+
+  def initialize(@tag: String)
+  end
+
+  def perform(job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO tt_tags (job_id, tag) VALUES ($1, $2)", [job.id, @tag])
+  end
+end
+
 # `Divider::Testing`: fake, inline (in and out of transactions) and drain.
 class TestingTest < Test::Case
   include Divider::Testing::Assertions
@@ -51,6 +64,7 @@ class TestingTest < Test::Case
         begin
           Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_tt_versions").migrate
           repo.exec("CREATE TABLE tt_runs (job_id bigint PRIMARY KEY)")
+          repo.exec("CREATE TABLE tt_tags (job_id bigint PRIMARY KEY, tag text NOT NULL)")
           yield repo
         ensure
           TestingTest.reset(repo)
@@ -62,7 +76,7 @@ class TestingTest < Test::Case
   end
 
   def self.reset(repo: Rotor::Repo) -> Void
-    repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_tt_versions, tt_runs")
+    repo.exec("DROP TABLE IF EXISTS divider_jobs, divider_cron, divider_tt_versions, tt_runs, tt_tags")
   end
 
   def runs(repo: Rotor::Repo) -> Int = repo.query("SELECT count(*) FROM tt_runs") { |r| r.int(0) }[0]
@@ -236,6 +250,51 @@ class TestingTest < Test::Case
         TtOnceSnooze.enqueue(repo)
         nil
       end
+      assert_equal(1, runs(repo))
+    end
+  end
+
+  def tags(repo: Rotor::Repo) -> Array[String] = repo.query("SELECT tag FROM tt_tags ORDER BY job_id") { |r| r.string(0) }
+
+  # `inline` with a factory: its instances run, until the block ends.
+  def test_inline_with_factories
+    with_repo do |repo|
+      double = Divider.factory(TtTagged) { TtTagged.new("double") }
+      Divider::Testing.inline(repo, factories: [double]) do
+        TtTagged.enqueue(repo)
+        repo.transaction do |tx|
+          TtTagged.enqueue(tx)
+          nil
+        end
+        nil
+      end
+      assert_equal(["double", "double"], tags(repo))
+      # Reset with the rest of the state: without one, the attempt fails
+      # (TtTagged `needs_factory`).
+      job = Divider::Testing.inline(repo) { TtTagged.enqueue(repo) }
+      assert_equal(["failed", "ArgumentError: TtTagged needs a factory, and none is given"],
+                   repo.query("SELECT state, (errors->0->>'error') || ': ' || (errors->0->>'message') FROM divider_jobs WHERE id = $1", [job.id]) { |r| [r.string(0), r.string(1)] }[0])
+      assert_equal(2, tags(repo).size)
+      twice = [double, Divider.factory(TtTagged) { TtTagged.new("other") }]
+      e = assert_raise(ArgumentError) { Divider::Testing.inline(repo, factories: twice) { nil } }
+      assert_equal("TtTagged is given two factories", e.message)
+      # (Refused before the mode is set: `fake` can start.)
+      Divider::Testing.fake { nil }
+    end
+  end
+
+  def test_drain_with_factories
+    with_repo do |repo|
+      2.times { TtTagged.enqueue(repo) }
+      TtNote.enqueue(repo)
+      e = assert_raise(ArgumentError) do
+        Divider::Testing.drain(repo, jobs: [TtNote], factories: [Divider.factory(TtTagged) { TtTagged.new("x") }])
+      end
+      assert_equal("a factory is given for TtTagged, which is not in jobs", e.message)
+      e = assert_raise(ArgumentError) { Divider::Testing.drain(repo, jobs: [TtTagged, TtNote]) }
+      assert_equal("TtTagged needs a factory (it declares `needs_factory`): pass Divider.factory(TtTagged) { ... } in factories:", e.message)
+      assert_equal(3, Divider::Testing.drain(repo, jobs: [TtTagged, TtNote], factories: [Divider.factory(TtTagged) { TtTagged.new("drained") }]))
+      assert_equal(["drained", "drained"], tags(repo))
       assert_equal(1, runs(repo))
     end
   end

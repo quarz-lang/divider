@@ -42,11 +42,13 @@ module Testing
 
   # :nodoc:
   # The mode (`:off`, `:fake`, `:inline`), `fake`'s records, the jobs
-  # `inline` defers until their transaction is over, and the next fake id.
-  data State = (mode: Symbol, recorded: Array[Recorded], pending: Array[[Int, Type[Job]]], next_id: Int)
+  # `inline` defers until their transaction is over, the next fake id, and
+  # `inline`'s factories by class name.
+  data State = (mode: Symbol, recorded: Array[Recorded], pending: Array[[Int, Type[Job]]], next_id: Int,
+                factories: Hash[String, Factory])
 
   # :nodoc:
-  STATE = Atom[State].new(State.new(:off, Array[Recorded].new, Array[[Int, Type[Job]]].new, -1))
+  STATE = Atom[State].new(State.new(:off, Array[Recorded].new, Array[[Int, Type[Job]]].new, -1, Hash[String, Factory].new))
 
   # Runs the block with enqueues recorded instead of inserted (each given
   # an [Enqueued] with an id from -1 down, `available`, or `scheduled` at
@@ -72,9 +74,13 @@ module Testing
   # one enqueued inside a transaction at the next enqueue outside one, or
   # when the block ends (a rolled-back one has no row, and does not run).
   # Jobs run as a worker runs them (their outcome recorded in the row): a
-  # [Snooze] leaves the job scheduled, not run again.
-  def self.inline[R](repo: Rotor::Repo, &: () -> R) -> R
-    Testing.enter(:inline)
+  # [Snooze] leaves the job scheduled, not run again. `factories` make the
+  # instances of their classes ([Divider.factory]; one per class at most),
+  # as a worker's do: a test gives its doubles. They are kept with the
+  # rest of `inline`'s state, for the whole process until the block ends;
+  # tests that run at once use `drain(repo, jobs:, factories:)` instead.
+  def self.inline[R](repo: Rotor::Repo, *, factories: Array[Factory] = [], &: () -> R) -> R
+    Testing.enter(:inline, Factory.index(factories, nil))
     begin
       yield
     ensure
@@ -83,20 +89,24 @@ module Testing
         # was rolled back.)
         Testing.run_pending(repo, true)
       ensure
-        STATE.update { |s| s.with(mode: :off, pending: Array[[Int, Type[Job]]].new) }
+        STATE.update { |s| s.with(mode: :off, pending: Array[[Int, Type[Job]]].new, factories: Hash[String, Factory].new) }
       end
     end
   end
 
   # Runs, once, in the calling task, the jobs of the classes `jobs` due
-  # now in the table (not those they enqueue): how many ran.
-  def self.drain(repo: Rotor::Repo, *, jobs: Array[Type[Job]]) -> Int
+  # now in the table (not those they enqueue): how many ran. `factories`
+  # make the instances of their classes, which must be in `jobs`
+  # ([Divider.factory]); they are this call's only, so tests that run at
+  # once can each give their own.
+  def self.drain(repo: Rotor::Repo, *, jobs: Array[Type[Job]], factories: Array[Factory] = []) -> Int
     by_name: Hash[String, Type[Job]] = {}
     jobs.each { |j| by_name = by_name.put(j.name, j) }
+    made = Factory.index(factories, by_name)
     ids = repo.query("SELECT id FROM divider_jobs WHERE state IN ('available', 'scheduled', 'failed') AND scheduled_at <= now() " +
                      "AND cancelled_at IS NULL AND class IN (SELECT jsonb_array_elements_text($1::jsonb)) ORDER BY priority, scheduled_at, id",
                      [JSON.generate(by_name.keys)]) { |r| r.int(0) }
-    ids.count { |id| Testing.run_one(repo, id, by_name) }
+    ids.count { |id| Testing.run_one(repo, id, by_name, made) }
   end
 
   # The assertions of enqueued jobs, for a [Test::Case] that includes
@@ -131,13 +141,13 @@ module Testing
   end
 
   # :nodoc:
-  def self.enter(mode: Symbol) -> Void
+  def self.enter(mode: Symbol, factories: Hash[String, Factory] = {}) -> Void
     STATE.update do |s|
       raise ArgumentError.new("Divider::Testing.#{mode} inside #{s.mode}") unless s.mode == :off
       if mode == :fake
         s.with(mode: mode, recorded: Array[Recorded].new, next_id: -1)
       else
-        s.with(mode: mode, pending: Array[[Int, Type[Job]]].new)
+        s.with(mode: mode, pending: Array[[Int, Type[Job]]].new, factories: factories)
       end
     end
     nil
@@ -183,6 +193,7 @@ module Testing
   # The final pass goes on until nothing is pending (a job it runs may
   # enqueue more, in a transaction).
   def self.run_pending(repo: Rotor::Repo, final: Bool) -> Void
+    made = STATE.get.factories
     while true
       taken = Testing.take_pending
       return if taken.empty?
@@ -191,7 +202,7 @@ module Testing
       begin
         while i < taken.size
           entry = taken[i]
-          ran = Testing.run_one(repo, entry[0], {entry[1].name => entry[1]})
+          ran = Testing.run_one(repo, entry[0], {entry[1].name => entry[1]}, made)
           kept = kept + [entry] unless ran || final
           i += 1
         end
@@ -217,13 +228,13 @@ module Testing
 
   # :nodoc:
   # Runs the job `id` if it can be run now: whether it ran.
-  def self.run_one(repo: Rotor::Repo, id: Int, jobs: Hash[String, Type[Job]]) -> Bool
+  def self.run_one(repo: Rotor::Repo, id: Int, jobs: Hash[String, Type[Job]], factories: Hash[String, Factory]) -> Bool
     rows = repo.query(CLAIM, [id, NODE]) do |r|
       Fetched.new(r.int(0), r.string(1), r.string(2), r.string(3), r.int(4), r.int(5), r.time(6), r.time(7))
     end
     row = rows.first?
     return false if row.nil?
-    runner = Runner.new(repo, jobs, NODE, 1, nil, nil)
+    runner = Runner.new(repo, jobs, NODE, 1, nil, nil, factories: factories)
     runner.record(row, runner.run_attempt(row))
     true
   end
