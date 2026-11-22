@@ -39,9 +39,9 @@ class TtBatch < Divider::Job
   end
 end
 
-# Notes its run with its factory's tag (a test's double).
+# Notes its run with its factory's tag (a test's double); needs a
+# factory without writing `needs_factory`.
 class TtTagged < Divider::Job
-  needs_factory
   @tag: String
 
   def initialize(@tag: String)
@@ -270,7 +270,7 @@ class TestingTest < Test::Case
       end
       assert_equal(["double", "double"], tags(repo))
       # Reset with the rest of the state: without one, the attempt fails
-      # (TtTagged `needs_factory`).
+      # (TtTagged needs a factory).
       job = Divider::Testing.inline(repo) { TtTagged.enqueue(repo) }
       assert_equal(["failed", "ArgumentError: TtTagged needs a factory, and none is given"],
                    repo.query("SELECT state, (errors->0->>'error') || ': ' || (errors->0->>'message') FROM divider_jobs WHERE id = $1", [job.id]) { |r| [r.string(0), r.string(1)] }[0])
@@ -292,7 +292,7 @@ class TestingTest < Test::Case
       end
       assert_equal("a factory is given for TtTagged, which is not in jobs", e.message)
       e = assert_raise(ArgumentError) { Divider::Testing.drain(repo, jobs: [TtTagged, TtNote]) }
-      assert_equal("TtTagged needs a factory (it declares `needs_factory`): pass Divider.factory(TtTagged) { ... } in factories:", e.message)
+      assert_equal("TtTagged needs a factory (its `new` takes arguments, or it declares `needs_factory`): pass Divider.factory(TtTagged) { ... } in factories:", e.message)
       assert_equal(3, Divider::Testing.drain(repo, jobs: [TtTagged, TtNote], factories: [Divider.factory(TtTagged) { TtTagged.new("drained") }]))
       assert_equal(["drained", "drained"], tags(repo))
       assert_equal(1, runs(repo))

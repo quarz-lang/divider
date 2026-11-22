@@ -55,6 +55,82 @@ class FtTaggedAgain < FtTagged
   needs_factory
 end
 
+# Needing a factory without writing `needs_factory` (its `initialize`
+# takes an argument), and a subclass of it whose own `initialize` takes
+# none: it stays one made by a factory.
+class FtImplicit < Divider::Job
+  @deps: FtDeps
+
+  def initialize(@deps: FtDeps)
+  end
+
+  def perform(job: Divider::Context) -> Void
+    job.repo.exec("INSERT INTO ft_runs (job_id, attempt, tag) VALUES ($1, $2, $3)", [job.id, job.attempt, "implicit #{@deps.tag}"])
+  end
+end
+
+class FtImplicitSub < FtImplicit
+  def initialize
+    super(FtDeps.new("own", Atom[Int].new(0)))
+  end
+end
+
+# An abstract job whose `initialize` takes an argument, and a concrete
+# subclass of it: needing a factory too.
+abstract class FtAbstractDeps < Divider::Job
+  @deps: FtDeps
+
+  def initialize(@deps: FtDeps)
+  end
+end
+
+class FtConcreteDeps < FtAbstractDeps
+  def perform(job: Divider::Context) -> Void
+  end
+end
+
+# Made with `new`: an `initialize` whose parameters (a keyword one
+# included) all have defaults, and one of two overloads taking none.
+class FtKeywordDefault < Divider::Job
+  @tag: String
+
+  def initialize(*, tag: String = "kw")
+    @tag = tag
+  end
+
+  def perform(job: Divider::Context) -> Void
+  end
+end
+
+class FtOverloads < Divider::Job
+  @tag: String
+
+  def initialize(@tag: String)
+  end
+
+  def initialize
+    @tag = "none"
+  end
+
+  def perform(job: Divider::Context) -> Void
+  end
+end
+
+# An `initialize` that takes no argument but requires a block: `new`'s
+# signatures cannot tell it, so it writes `needs_factory` (without it,
+# `new_job` would call `new` without a block: quarz-lang/quarz#1065).
+class FtBlockInit < Divider::Job
+  needs_factory
+  @tag: String
+
+  def initialize(&make: () -> String)
+    @tag = make.call
+  end
+
+  def perform(job: Divider::Context) -> Void
+  end
+end
+
 # Made with `new` or, given one, by a factory, which tags it.
 class FtOptional < Divider::Job
   @tag: String
@@ -122,7 +198,7 @@ end
 # Workers given factories ([Divider.factory]) against a server
 # (`PG::Testing`).
 class FactoryTest < Test::Case
-  ALL = [FtTagged, FtTaggedSub, FtTaggedAgain, FtOptional, FtFlaky, FtPlain, FtFactoryRaises, FtPerformRaises, FtBase, FtTimed, FtBlocked]
+  ALL = [FtTagged, FtTaggedSub, FtTaggedAgain, FtImplicit, FtImplicitSub, FtOptional, FtFlaky, FtPlain, FtFactoryRaises, FtPerformRaises, FtBase, FtTimed, FtBlocked]
 
   def with_repo(&: (Rotor::Repo, String) -> Void) -> Void
     PG::Testing.with_cluster do |url|
@@ -155,6 +231,8 @@ class FactoryTest < Test::Case
      end,
      Divider.factory(FtTaggedSub) { FtTaggedSub.new(deps) },
      Divider.factory(FtTaggedAgain) { FtTaggedAgain.new(deps) },
+     Divider.factory(FtImplicit) { FtImplicit.new(deps) },
+     Divider.factory(FtImplicitSub) { FtImplicitSub.new },
      Divider.factory(FtFlaky) do
        made.update { |n| n + 1 }
        FtFlaky.new(deps)
@@ -207,14 +285,16 @@ class FactoryTest < Test::Case
       sub = FtTaggedSub.enqueue(repo)
       again = FtTaggedAgain.enqueue(repo)
       optional = FtOptional.enqueue(repo)
-      jobs = [tagged, flaky, plain, sub, again, optional]
+      implicit = FtImplicit.enqueue(repo)
+      implicit_sub = FtImplicitSub.enqueue(repo)
+      jobs = [tagged, flaky, plain, sub, again, optional, implicit, implicit_sub]
       # (A factory for FtOptional, which does not need one: it is used.)
       w = worker(url, tagged("given", made) + [Divider.factory(FtOptional) { FtOptional.new("optional") }])
       run_until(w) { jobs.all? { |j| state(repo, j.id) == "completed" } }
       assert_equal(jobs.map { |_| "completed" }, jobs.map { |j| state(repo, j.id) })
       runs = repo.query("SELECT job_id, attempt, tag FROM ft_runs ORDER BY job_id") { |r| "#{r.int(0)} #{r.int(1)} #{r.string(2)}" }
       assert_equal(["#{tagged.id} 1 given", "#{flaky.id} 2 given", "#{plain.id} 1 new", "#{sub.id} 1 given", "#{again.id} 1 given",
-                    "#{optional.id} 1 optional"], runs)
+                    "#{optional.id} 1 optional", "#{implicit.id} 1 implicit given", "#{implicit_sub.id} 1 implicit own"], runs)
       # FtTagged once, FtFlaky for each of its two attempts.
       assert_equal(3, made.get)
     end
@@ -339,14 +419,27 @@ class FactoryTest < Test::Case
     # A class that needs a factory, without one: refused at the start,
     # a subclass inheriting the declaration too.
     e = assert_raise(ArgumentError) { Divider::Worker.new(url, jobs: [FtPlain, FtTagged]) }
-    assert_equal("FtTagged needs a factory (it declares `needs_factory`): pass Divider.factory(FtTagged) { ... } in factories:", e.message)
+    assert_equal("FtTagged needs a factory (its `new` takes arguments, or it declares `needs_factory`): pass Divider.factory(FtTagged) { ... } in factories:", e.message)
     e = assert_raise(ArgumentError) { Divider.serve(url, jobs: [FtTagged]) }
-    assert_equal("FtTagged needs a factory (it declares `needs_factory`): pass Divider.factory(FtTagged) { ... } in factories:", e.message)
+    assert_equal("FtTagged needs a factory (its `new` takes arguments, or it declares `needs_factory`): pass Divider.factory(FtTagged) { ... } in factories:", e.message)
     only_parent = tagged("x", made).select { |f| f.job == FtTagged }
     e = assert_raise(ArgumentError) { Divider::Worker.new(url, jobs: [FtTagged, FtTaggedSub], factories: only_parent) }
-    assert_equal("FtTaggedSub needs a factory (it declares `needs_factory`): pass Divider.factory(FtTaggedSub) { ... } in factories:", e.message)
+    assert_equal("FtTaggedSub needs a factory (its `new` takes arguments, or it declares `needs_factory`): pass Divider.factory(FtTaggedSub) { ... } in factories:", e.message)
     assert_true(FtTaggedSub.job_needs_factory)
     assert_false(FtOptional.job_needs_factory)
+    # Without `needs_factory`: a class whose `new` takes arguments needs
+    # one, and so does a subclass of it, also when its own `new` takes
+    # none; one whose `new` may be called without arguments does not.
+    e = assert_raise(ArgumentError) { Divider::Worker.new(url, jobs: [FtImplicit]) }
+    assert_equal("FtImplicit needs a factory (its `new` takes arguments, or it declares `needs_factory`): pass Divider.factory(FtImplicit) { ... } in factories:", e.message)
+    e = assert_raise(ArgumentError) { Divider::Worker.new(url, jobs: [FtImplicitSub]) }
+    assert_equal("FtImplicitSub needs a factory (its `new` takes arguments, or it declares `needs_factory`): pass Divider.factory(FtImplicitSub) { ... } in factories:", e.message)
+    e = assert_raise(ArgumentError) { FtImplicit.new_job }
+    assert_equal("FtImplicit needs a factory, and none is given", e.message)
+    assert_true([FtImplicit, FtImplicitSub, FtConcreteDeps, FtBlockInit].all? { |c| c.job_needs_factory })
+    assert_false([FtKeywordDefault, FtOverloads, FtPlain].any? { |c| c.job_needs_factory })
+    assert_equal("FtKeywordDefault", FtKeywordDefault.new_job.class.name)
+    assert_equal("FtOverloads", FtOverloads.new_job.class.name)
     assert_equal(0, made.get)
   end
 end
