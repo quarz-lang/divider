@@ -32,7 +32,7 @@ class Factory
   # :nodoc:
   # `factories` by their classes' names: `ArgumentError` for two of one
   # class, or, given `jobs`, one for a class not in it, or a class of it
-  # that `needs_factory` without one.
+  # that needs a factory without one.
   def self.index(factories: Array[Factory], jobs: Hash[String, Type[Job]]?) -> Hash[String, Factory]
     by_name: Hash[String, Factory] = {}
     factories.each do |f|
@@ -46,7 +46,7 @@ class Factory
     end
     jobs&.each_value do |j|
       if j.job_needs_factory && !by_name.key?(j.name)
-        raise ArgumentError.new("#{j.name} needs a factory (it declares `needs_factory`): pass Divider.factory(#{j.name}) { ... } in factories:")
+        raise ArgumentError.new("#{j.name} needs a factory (its `new` takes arguments, or it declares `needs_factory`): pass Divider.factory(#{j.name}) { ... } in factories:")
       end
     end
     by_name
@@ -56,8 +56,8 @@ end
 # The factory of the job class `job`: the worker (or [Divider::Testing])
 # calls `build` for each attempt of a job of that class, instead of `new`,
 # and runs the instance it gives. A job takes what it needs from the
-# application in its own `initialize`, and declares
-# [Divider::Job.needs_factory]:
+# application in its own `initialize`, which then takes arguments, and
+# so needs a factory ([Divider::Job.inherited]):
 #
 # ```quarz no_run
 # # (A client every attempt shares: Shareable.)
@@ -70,8 +70,6 @@ end
 # end
 #
 # class Deliver < Divider::Job
-#   needs_factory
-#
 #   @notifier: Notifier
 #
 #   def initialize(@notifier: Notifier)
@@ -90,9 +88,10 @@ end
 # - `build` gives a `job` (the checker refuses a block of another class);
 #   an instance of a subclass fails the attempt with an [ArgumentError]
 #   that names both classes.
-# - A class that declares `needs_factory` must be given one (an
-#   [ArgumentError] when the worker is made, naming it); one that does
-#   not may be given one too, instead of `new`.
+# - A class that needs one (its `new` takes arguments, or it declares
+#   [Divider::Job.needs_factory]) must be given one (an [ArgumentError]
+#   when the worker is made, naming it); another may be given one too,
+#   instead of `new`.
 # - It is called once per attempt, on the attempt's own task: after the
 #   `:started` event, inside the job's `timeout`, stopped by `shutdown` as
 #   `perform` is. One that raises fails the attempt as a `perform` that

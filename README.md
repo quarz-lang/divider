@@ -142,14 +142,12 @@ worker.run      # or Task.spawn { worker.run } beside an HTTP server
 
 ### Jobs that need something from the application
 
-A job takes what it needs (a client, a cache) in its own `initialize`
-and declares `needs_factory`, and the worker is given a factory for its
-class, which it calls for each attempt instead of `new`:
+A job takes what it needs (a client, a cache) in its own `initialize`,
+and the worker is given a factory for its class, which it calls for each
+attempt instead of `new`:
 
 ```crystal
 class Deliver < Divider::Job
-  needs_factory
-
   @client: HTTP::Client
 
   def initialize(@client: HTTP::Client)
@@ -165,20 +163,26 @@ worker = Divider::Worker.new(ENV["DATABASE_URL"], jobs: [Cleanup, Deliver],
                              factories: [Divider.factory(Deliver) { Deliver.new(client) }])
 ```
 
-- `needs_factory` is needed because a job is otherwise made with `new` in
-  a class method it inherits from `Divider::Job`, which Quarz allows only
-  for a class whose `initialize` takes no argument (or that overrides the
-  method, as the statement does). Without it, the class does not compile:
-  the checker says that `Deliver#initialize` does not take the arguments
-  of `new` in `Divider::Job.new_job`, which `Deliver` inherits. A worker
-  (or `Testing.drain`) given such a class without its factory raises
-  `ArgumentError` at once ("Deliver needs a factory (it declares
-  needs_factory): pass Divider.factory(Deliver) { ... } in factories:").
-  A subclass inherits the declaration.
+- A job none of whose `initialize`s can be called without arguments
+  needs a factory: `Divider::Job` declares it for the class (its
+  `inherited` hook), as the `needs_factory` statement does. A worker (or
+  `Testing.drain`) given such a class without its factory raises
+  `ArgumentError` at once ("Deliver needs a factory (its `new` takes
+  arguments, or it declares `needs_factory`): pass
+  Divider.factory(Deliver) { ... } in factories:"). A subclass inherits
+  it, whatever its own `initialize` takes.
+- `needs_factory` is unnecessary for such a class, and still accepted.
+  A job writes it when its `initialize` takes no argument but requires
+  a block, which the hook cannot tell from one taking nothing (the
+  block is not among the constructor's parameters). Without it, such a
+  job is made with `new` and no block, which fails each attempt (the
+  checker does not refuse it yet: quarz-lang/quarz#1065). A job whose
+  `new` takes no argument may also write it to be made by a factory
+  only.
 - `Divider.factory(Deliver) { ... }` must give a `Deliver`: a block giving
   another class does not compile, and an instance of a subclass fails the
   attempt. A class without a factory is made with `new`; one that
-  does not declare `needs_factory` may be given a factory too. A factory
+  does not need a factory may be given one too. A factory
   is for a class in `jobs:`, one per class (`ArgumentError` otherwise).
 - The factory is called once per attempt, in the attempt's task: inside
   the job's `timeout`, stopped by `shutdown` as `perform` is. One that
