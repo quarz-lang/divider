@@ -111,3 +111,14 @@ class NeedsTwice < Divider::Job
   needs_factory
   needs_factory
 end
+
+# An `initialize` that requires a block and no `needs_factory`: the hook
+# cannot tell it from one taking nothing, and the checker refuses it, as
+# `new_job` calls `new` without a block.
+class BlockInit < Divider::Job
+  @tag: String
+
+  def initialize(&make: () -> String)
+    @tag = make.call
+  end
+end

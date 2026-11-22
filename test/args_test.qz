@@ -49,6 +49,9 @@ class ArgsTest < Test::Case
     # divider#38: a factory's block gives an instance of its class.
     assert_match(/main\.qz:107:28: error: block returns NoPerform but Fine was expected/, text)
     assert_match(/main\.qz:112:3: error: `needs_factory` raised ArgumentError: NeedsTwice declares `needs_factory` twice/, text)
+    # A block-requiring `initialize` without `needs_factory`: `new_job`
+    # calls `new` without a block (quarz-lang/quarz#1065).
+    assert_match(/main\.qz:121:3: error: `BlockInit#initialize` does not take the arguments of `new` in `Divider::Job\.new_job`, which `BlockInit` inherits/, text)
   end
 
   def test_jobs_with_arguments
