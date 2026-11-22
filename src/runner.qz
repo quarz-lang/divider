@@ -11,10 +11,12 @@ class Runner
   @keep_completed_ms: Int
   @on_error: (shareable (Exception, Context) -> Void)?
   @on_event: (shareable (Event) -> Void)?
+  # The factories of the classes that have one, by name.
+  @factories: Hash[String, Factory]
 
   def initialize(@repo: Rotor::Repo, @jobs: Hash[String, Type[Job]], @node: String, @keep_completed_ms: Int,
                  @on_error: (shareable (Exception, Context) -> Void)?, @on_event: (shareable (Event) -> Void)?,
-                 job_repo: Rotor::Repo? = nil)
+                 job_repo: Rotor::Repo? = nil, @factories: Hash[String, Factory] = {})
     @job_repo = job_repo || @repo
   end
 
@@ -28,10 +30,12 @@ class Runner
       emit(:started, row, nil, nil)
       cls = @jobs[row.class_name]
       limit = cls.job_timeout_ms
+      # (The instance is made in the attempt: a factory's time counts
+      # toward the timeout, and what it raises fails the attempt.)
       if limit
-        Task.timeout(limit.ms) { cls.run_job(ctx, row.args) }
+        Task.timeout(limit.ms) { instance(cls).run_with(ctx, row.args) }
       else
-        cls.run_job(ctx, row.args)
+        instance(cls).run_with(ctx, row.args)
       end
       Outcome.new(@keep_completed_ms == 0 ? Worker::FINISH_DELETE : Worker::FINISH_COMPLETED, nil, nil, :completed, Worker.ms_since(started), nil)
     rescue Task::Cancelled => c
@@ -44,6 +48,13 @@ class Runner
       Task.check_cancel
       failure(row, ctx, e, started)
     end
+  end
+
+  # :nodoc:
+  # An instance of `cls` for an attempt: its factory's, or `new`.
+  def instance(cls: Type[Job]) -> Job
+    f = @factories[cls.name]?
+    f ? f.make : cls.new_job
   end
 
   # :nodoc:

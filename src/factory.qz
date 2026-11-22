@@ -1,0 +1,106 @@
+# How a worker makes the instances of a job class that needs something
+# from the application (a client, a cache), made by [Divider.factory]: the
+# worker calls it for each attempt of a job of that class, and `new` for
+# the classes without one.
+class Factory
+  include Shareable
+
+  @job: Type[Job]
+  @build: shareable () -> Job
+
+  # :nodoc:
+  # (Made by `Divider.factory`, which ties the block's result to the class.)
+  def initialize(@job: Type[Job], @build: shareable () -> Job)
+  end
+
+  # The job class it makes instances of.
+  def job -> Type[Job] = @job
+
+  # :nodoc:
+  # An instance for an attempt: the block's, which must be of the class
+  # itself (the type lets a subclass's through).
+  def make -> Job
+    made = @build.call
+    unless made.class == @job
+      raise ArgumentError.new("the factory of #{@job.name} made a #{made.class.name}: it must make a #{@job.name} itself, not another class")
+    end
+    made
+  end
+
+  def inspect -> String = "#<Divider::Factory #{@job.name}>"
+
+  # :nodoc:
+  # `factories` by their classes' names: `ArgumentError` for two of one
+  # class, or, given `jobs`, one for a class not in it, or a class of it
+  # that `needs_factory` without one.
+  def self.index(factories: Array[Factory], jobs: Hash[String, Type[Job]]?) -> Hash[String, Factory]
+    by_name: Hash[String, Factory] = {}
+    factories.each do |f|
+      n = f.job.name
+      raise ArgumentError.new("#{n} is given two factories") if by_name.key?(n)
+      if jobs
+        known = jobs[n]?
+        raise ArgumentError.new("a factory is given for #{n}, which is not in jobs") if known.nil? || !(known == f.job)
+      end
+      by_name = by_name.put(n, f)
+    end
+    jobs&.each_value do |j|
+      if j.job_needs_factory && !by_name.key?(j.name)
+        raise ArgumentError.new("#{j.name} needs a factory (it declares `needs_factory`): pass Divider.factory(#{j.name}) { ... } in factories:")
+      end
+    end
+    by_name
+  end
+end
+
+# The factory of the job class `job`: the worker (or [Divider::Testing])
+# calls `build` for each attempt of a job of that class, instead of `new`,
+# and runs the instance it gives. A job takes what it needs from the
+# application in its own `initialize`, and declares
+# [Divider::Job.needs_factory]:
+#
+# ```quarz no_run
+# # (A client every attempt shares: Shareable.)
+# class Notifier
+#   include Shareable
+#
+#   def send(text: String) -> Void
+#     STDERR.puts text
+#   end
+# end
+#
+# class Deliver < Divider::Job
+#   needs_factory
+#
+#   @notifier: Notifier
+#
+#   def initialize(@notifier: Notifier)
+#   end
+#
+#   def perform(job: Divider::Context) -> Void
+#     @notifier.send("job #{job.id}")
+#   end
+# end
+#
+# notifier = Notifier.new
+# worker = Divider::Worker.new(ENV["DATABASE_URL"], jobs: [Deliver],
+#                              factories: [Divider.factory(Deliver) { Deliver.new(notifier) }])
+# ```
+#
+# - `build` gives a `job` (the checker refuses a block of another class);
+#   an instance of a subclass fails the attempt with an [ArgumentError]
+#   that names both classes.
+# - A class that declares `needs_factory` must be given one (an
+#   [ArgumentError] when the worker is made, naming it); one that does
+#   not may be given one too, instead of `new`.
+# - It is called once per attempt, on the attempt's own task: after the
+#   `:started` event, inside the job's `timeout`, stopped by `shutdown` as
+#   `perform` is. One that raises fails the attempt as a `perform` that
+#   raises does (`on_error`, the row's errors, a retry, or the discard
+#   after `max_attempts`).
+# - The block is `shareable`, since attempts run in tasks of their own:
+#   what it captures must be Shareable, and is shared by every attempt,
+#   several at once (an `HTTP::Client` is; a value the attempts update
+#   goes in an [Atom]); a [Rotor::Repo] is not Shareable and cannot be
+#   captured: a job queries through `job.repo`.
+public def factory[J <: Job](job: Type[J], &build: shareable () -> J) -> Factory = Factory.new(job, build)

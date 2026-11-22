@@ -46,6 +46,9 @@ class ArgsTest < Test::Case
     # (`Fine` and the others that declare `Good` are refused at nothing
     # else: their `perform` is GoodBase's.)
     refute_match(/main\.qz:(40|45|50|56|60):3: error: `method_ref/, text)
+    # divider#38: a factory's block gives an instance of its class.
+    assert_match(/main\.qz:107:28: error: block returns NoPerform but Fine was expected/, text)
+    assert_match(/main\.qz:112:3: error: `needs_factory` raised ArgumentError: NeedsTwice declares `needs_factory` twice/, text)
   end
 
   def test_jobs_with_arguments
