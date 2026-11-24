@@ -116,17 +116,16 @@ class Runner
     written = Task.uncancellable do
       begin
         Task.timeout(Worker::RECORD_LIMIT) do
-          params: Array[Object?] = [row.id, @node, row.attempt]
-          if o.sql == Worker::FINISH_SNOOZED
-            params = params + [o.number]
-          elsif o.sql == Worker::FINISH_FAILED
-            params = params + [o.error_json, o.number]
-          elsif o.error_json
-            params = params + [o.error_json]
+          begin
+            write_outcome(row, o, o.error_json)
+          rescue StandardError => e
+            raise e if o.error_json.nil?
+            # The error's text may be what the database refused: once
+            # more with a fixed one, so that the attempt still ends
+            # (divider#43) instead of the rescue running it again.
+            STDERR.puts "divider: recording job #{row.id}'s error failed (#{e.class.name}: #{e.message}); recording it without the error's text"
+            write_outcome(row, o, Runner.unrecorded_error_json(row))
           end
-          # (The state the row took: a cancellation asked meanwhile
-          # makes it `cancelled`; none when another node rescued it.)
-          @repo.query(o.sql + " RETURNING state", params) { |r| r.string(0) }.first?
         end
       rescue StandardError => e
         STDERR.puts "divider: recording job #{row.id} as #{o.kind} failed (#{e.class.name}: #{e.message}); it is rescued later"
@@ -143,6 +142,29 @@ class Runner
            else :cancelled
            end
     emit(kind, row, o.ms, o.message)
+  end
+
+  # :nodoc:
+  # Runs `o`'s finishing statement for `row` with `error_json` as its
+  # error: the state the row took (a cancellation asked meanwhile makes
+  # it `cancelled`; none when another node rescued it).
+  def write_outcome(row: Fetched, o: Outcome, error_json: String?) -> String?
+    params: Array[Object?] = [row.id, @node, row.attempt]
+    if o.sql == Worker::FINISH_SNOOZED
+      params = params + [o.number]
+    elsif o.sql == Worker::FINISH_FAILED
+      params = params + [error_json, o.number]
+    elsif error_json
+      params = params + [error_json]
+    end
+    @repo.query(o.sql + " RETURNING state", params) { |r| r.string(0) }.first?
+  end
+
+  # :nodoc:
+  # The error recorded when the error's own text could not be.
+  def self.unrecorded_error_json(row: Fetched) -> String
+    JSON.generate({"attempt" => row.attempt, "error" => "Divider::Unrecorded",
+                   "message" => "the error could not be recorded"})
   end
 
   # :nodoc:
@@ -165,9 +187,15 @@ class Runner
 
   # :nodoc:
   def error_json(row: Fetched, e: Exception) -> String
-    JSON.generate({"attempt" => row.attempt, "error" => e.class.name, "message" => e.message,
-                   "backtrace" => e.backtrace.first(10)})
+    JSON.generate({"attempt" => row.attempt, "error" => Runner.storable(e.class.name),
+                   "message" => Runner.storable(e.message),
+                   "backtrace" => e.backtrace.first(10).map { |l| Runner.storable(l) }})
   end
+
+  # :nodoc:
+  # `text` with U+0000 replaced by U+FFFD: PostgreSQL's `jsonb` refuses
+  # the escape `\u0000` that `JSON.generate` writes for it (divider#43).
+  def self.storable(text: String) -> String = text.include?("\u0000") ? text.gsub("\u0000", "\uFFFD") : text
 
   # :nodoc:
   # `on_error`, or the error on standard error.
