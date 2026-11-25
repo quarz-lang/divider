@@ -178,7 +178,8 @@ abstract class Job
   # type, so a call with a value of another type does not compile. The
   # worker decodes the stored arguments ([JSON.decode]) and
   # calls `perform(args, job)`; arguments that do not decode discard the
-  # job with [Divider::ArgsError], which names where. A field cannot be
+  # job with [Divider::ArgsError], which names where and what was expected (not
+  # the value found: it may be a secret). A field cannot be
   # named `repo`, `at`, `after` or `priority`, and `job_args` comes once.
   static def self.job_args[A](type: Type[A]) -> Void
     perform = method_ref[(A, Context) -> Void](:perform)
@@ -232,10 +233,25 @@ abstract class Job
       decoded = begin
         JSON.decode[A](text)
       rescue JSON::DecodeError => e
-        raise ArgsError.new("the stored arguments do not fit #{type_name}: #{e.message}")
+        raise ArgsError.new("the stored arguments do not fit #{type_name}: #{Job.without_value(e.message)}")
       end
       perform.bind(self).call(decoded, job)
     end
+  end
+
+  # What [JSON::DecodeError]'s message says of where the stored arguments
+  # do not fit and what was expected, without the value it found
+  # (`$.token: expected an integer that fits an Int, found "..."`): the
+  # message goes to logs, `on_error`, events and the row's `errors`, and
+  # an argument may be a secret. A message that is not of that form (a
+  # decoder's own, as for a decimal past its limit) keeps its path only.
+  #
+  # :nodoc:
+  def self.without_value(message: String) -> String
+    head, found, _ = message.partition(", found ")
+    return head unless found.empty?
+    return message if message.include?(": missing field `")
+    message.partition(": ")[0]
   end
 
   # The class of the job's arguments, or nil for a job without (generated
