@@ -103,6 +103,13 @@ class WtArgsError < Divider::Job
   end
 end
 
+class WtTyped < Divider::Job
+  data Args = (n: Int, token: String)
+  job_args Args
+  def perform(args: Args, job: Divider::Context) -> Void
+  end
+end
+
 class WtSnoozeNow < Divider::Job
   def perform(job: Divider::Context) -> Void
     raise Divider::Snooze.new(0.seconds)
@@ -163,7 +170,7 @@ end
 # with two workers, the notification, failures and retries, Discard,
 # Snooze, timeouts, cancellation, shutdown, rescue and pruning.
 class WorkerTest < Test::Case
-  ALL = [WtCount, WtFail, WtDiscard, WtDiscardNul, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo, WtArgsError, WtQuick, WtSnoozeNow, WtRetry, WtRetryNegative, WtRetryRaises, WtHold]
+  ALL = [WtCount, WtFail, WtDiscard, WtDiscardNul, WtSnooze, WtSlow, WtLong, WtBlock, WtFinish, WtNoPerform, WtShared, WtAwait, WtTwo, WtArgsError, WtTyped, WtQuick, WtSnoozeNow, WtRetry, WtRetryNegative, WtRetryRaises, WtHold]
 
   def with_repo(&: (Rotor::Repo, String) -> Void) -> Void
     PG::Testing.with_cluster do |url|
@@ -568,6 +575,25 @@ class WorkerTest < Test::Case
       run_until(worker(url)) { state(repo, job.id) == "discarded" }
       assert_equal([["discarded", 1]], repo.query("SELECT state, attempt FROM divider_jobs") { |r| [r.string(0), r.int(1)] })
     end
+  end
+
+  # divider#44: the stored arguments that do not fit are discarded with a
+  # message naming the path and what was expected, not the value found.
+  def test_args_that_do_not_fit_name_no_value
+    with_repo do |repo, url|
+      job = WtTyped.enqueue(repo: repo, n: 1, token: "t")
+      repo.exec("UPDATE divider_jobs SET args = '{\"n\": \"tok-s3cret-value\", \"token\": \"t\"}'::jsonb WHERE id = $1", [job.id])
+      run_until(worker(url)) { state(repo, job.id) == "discarded" }
+      messages = repo.query("SELECT e->>'message' FROM divider_jobs, jsonb_array_elements(errors) e WHERE id = $1", [job.id]) { |r| r.string(0) }
+      assert_equal(["the stored arguments do not fit WtTyped::Args: $.n: expected an integer that fits an Int"], messages)
+    end
+  end
+
+  def test_without_value_keeps_where_and_what
+    assert_equal("$.n: expected an integer that fits an Int", Divider::Job.without_value("$.n: expected an integer that fits an Int, found \"s3cret\""))
+    assert_equal("$.a: expected an integer that fits an Int", Divider::Job.without_value("$.a: expected an integer that fits an Int, found s3cret, found x"))
+    assert_equal("$: missing field `token` of WtTyped::Args", Divider::Job.without_value("$: missing field `token` of WtTyped::Args"))
+    assert_equal("$.price", Divider::Job.without_value("$.price: 's3cret' is no decimal"))
   end
 
   def test_a_zero_grace_leaves_nothing_running
