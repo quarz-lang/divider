@@ -660,6 +660,58 @@ class WorkerTest < Test::Case
     end
   end
 
+  # divider#45: the claim's rows are picked in a CTE evaluated once, and
+  # the update is driven from it. (Loose: node names as PostgreSQL 16
+  # and 17 print them.)
+  def test_the_claim_picks_its_rows_once
+    with_repo do |repo, url|
+      plan = repo.query("EXPLAIN (COSTS OFF) " + Divider::Worker::FETCH, ["default", 3, "n1", JSON.generate(["WtCount"])]) { |r| r.string(0) }
+      text = plan.join("\n")
+      assert_equal(1, plan.count { |l| l.strip == "CTE picked" }, text)
+      assert(plan.any? { |l| l.include?("CTE Scan on picked") }, text)
+      # The lock and the limit are the CTE's, under it.
+      cte = plan.index { |l| l.strip == "CTE picked" } || -1
+      assert(plan.drop(cte + 1).any? { |l| l.include?("LockRows") } && plan.drop(cte + 1).any? { |l| l.include?("Limit") }, text)
+      assert(plan[0].start_with?("Update on divider_jobs"), text)
+    end
+  end
+
+  # The ids a claim (`Worker::FETCH`) of up to `limit` WtCount jobs of
+  # the default queue gives the node `node`.
+  def self.claim(r: Rotor::Repo, node: String, limit: Int) -> Array[Int]
+    r.query(Divider::Worker::FETCH, ["default", limit, node, JSON.generate(["WtCount"])]) { |row| row.int(0) }
+  end
+
+  # divider#45: a claim never takes more than its limit, alone or with
+  # claims of other nodes at once, and no job is claimed twice.
+  def test_a_claim_takes_at_most_its_limit
+    with_repo do |repo, url|
+      120.times { WtCount.enqueue(repo) }
+      first = WorkerTest.claim(repo, "alone", 5)
+      assert_equal(5, first.size)
+      PG::Pool.open(url, 8) do |pool|
+        sizes: Array[Array[Int]] = Task.scope do |s|
+          (1..8).map do |w: Int|
+            s.spawn do
+              r = Rotor::Repo.new(pool: pool)
+              got: Array[Int] = []
+              loop do
+                ids = WorkerTest.claim(r, "node#{w}", 3)
+                break if ids.empty?
+                got = got.push(ids.size)
+              end
+              got
+            end
+          end.map(&:await)
+        end
+        all = sizes.flat_map { |xs| xs }
+        assert(all.all? { |n| n >= 1 && n <= 3 }, sizes.inspect)
+        assert_equal(115, all.sum)
+      end
+      assert_equal(120, count(repo, "SELECT count(*) FROM divider_jobs WHERE state = 'running' AND attempt = 1"))
+    end
+  end
+
   def test_unknown_classes_are_left_alone
     with_repo do |repo, url|
       repo.exec("INSERT INTO divider_jobs (class, queue) VALUES ('Gone', 'default')")

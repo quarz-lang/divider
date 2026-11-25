@@ -496,11 +496,19 @@ class Worker
   # The key of the advisory lock one node's maintenance holds.
   LOCK_KEY = 4_812_215_640_413_871
 
-  FETCH = "UPDATE divider_jobs SET state = 'running', node = $3, locked_at = now(), attempt = attempt + 1 " +
-          "WHERE id IN (SELECT id FROM divider_jobs WHERE queue = $1 " +
+  # The claim: up to $2 due jobs of the queue $1 whose class is one of
+  # $4, now `running` on the node $3. The rows are picked in a CTE
+  # marked MATERIALIZED, which PostgreSQL evaluates once per execution
+  # (SELECT's reference, "WITH Clause"), so the update claims the rows
+  # it picked and no more whatever plan the server chooses; an `IN`
+  # sub-select with LIMIT and a row lock carries no such promise
+  # (divider#45).
+  FETCH = "WITH picked AS MATERIALIZED (SELECT id FROM divider_jobs WHERE queue = $1 " +
           "AND state IN ('available', 'scheduled', 'failed') AND scheduled_at <= now() AND cancelled_at IS NULL " +
           "AND class IN (SELECT jsonb_array_elements_text($4::jsonb)) " +
           "ORDER BY priority, scheduled_at, id LIMIT $2 FOR UPDATE SKIP LOCKED) " +
+          "UPDATE divider_jobs SET state = 'running', node = $3, locked_at = now(), attempt = attempt + 1 " +
+          "WHERE id IN (SELECT id FROM picked) " +
           "RETURNING id, class, queue, args::text, attempt, max_attempts, inserted_at, scheduled_at"
 
   # (Each of these: $1 the id, $2 the node, $3 the attempt.)
