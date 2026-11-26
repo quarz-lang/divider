@@ -787,5 +787,10 @@ class WorkerTest < Test::Case
     end
     assert_equal("#<Divider::Worker node: \"n1\", queues: {\"default\" => 2}, database: \"db.example:5433/jobs\">", w.inspect)
     assert_false(w.to_s.include?("hunter2"))
+    # divider#52: a PG::Config in the URL's place, its password as hidden.
+    config = PG.parse_url("postgres://app@db.example:5433/jobs").with(password: "hunter2")
+    w = Divider::Worker.new(config, jobs: [WtCount], node: "n1", queues: {default: 2})
+    assert_equal("#<Divider::Worker node: \"n1\", queues: {\"default\" => 2}, database: \"db.example:5433/jobs\">", w.inspect)
+    assert_false([w].inspect.include?("hunter2"))
   end
 end

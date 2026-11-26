@@ -114,6 +114,10 @@ worker.run      # or Task.spawn { worker.run } beside an HTTP server
 # Divider.serve(url, jobs: ..., queues: ...): the same as a process's main (TERM/INT).
 ```
 
+- The database is a URL or a [PG::Config] (`Worker.new(config, ...)`,
+  `Divider.serve(config, ...)`): a password from elsewhere than the URL,
+  TLS settings given as keywords. `inspect` shows where the database is,
+  never its password.
 - The worker opens connections as they are needed and closes those idle
   for 5 minutes: the jobs' pool (`job.repo`, at most `pool_size:`, 10
   by default), a pool for its own statements (fetching, recording, the
