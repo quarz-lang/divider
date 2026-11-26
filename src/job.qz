@@ -166,6 +166,12 @@ abstract class Job
   #   also when two values of one call have the same key; an empty array
   #   inserts nothing. The queue is notified once.
   #
+  # The args type cannot have type parameters: a generic `data` type
+  # (`job_args Boxed[Int]`, or an alias of it) is refused, as a `Type`
+  # value does not say its fields' types; a field of a generic type with
+  # its arguments written (`inner: Inner[Int]`, `ids: Array[Int]`) is
+  # fine (divider#50).
+  #
   # A field's class is checked here: [Int], [Integer], [Float],
   # [String], [Bool], [Symbol], [Time], [Bytes], [Array], [Hash], [Set],
   # another `data` type of such fields, or a nullable or union one
@@ -185,6 +191,14 @@ abstract class Job
     perform = method_ref[(A, Context) -> Void](:perform)
     fields = type.fields
     raise ArgumentError.new("#{type.name} has no fields: a job without arguments needs no `job_args`") if fields.empty?
+    # (A generic data type: its fields' types are its parameters, which a
+    # `Type` value does not say for `Boxed[Int]` (divider#50).)
+    params: Array[Symbol] = []
+    fields.each { |f| params = Job.params_of(f.type_ref, type, params) }
+    unless params.empty?
+      raise ArgumentError.new("#{self.name}: the args type #{type.name} has type parameters (#{params.join(", ")}), which a job's " +
+                              "arguments cannot have: write a data type with the fields' types spelled out")
+    end
     fields.each do |f|
       if SCHEDULING.include?(f.name)
         raise ArgumentError.new("#{type.name}##{f.name}: a job's argument cannot be named #{f.name}, a keyword of `enqueue`")
@@ -257,6 +271,25 @@ abstract class Job
   # The class of the job's arguments, or nil for a job without (generated
   # by `job_args`).
   def self.job_args_type -> Type[Object]? = nil
+
+  # :nodoc:
+  # `found` with the names of `owner`'s type parameters `r` mentions, at
+  # any depth, added once each.
+  static def self.params_of(r: Meta::TypeRef, owner: Type[Object], found: Array[Symbol]) -> Array[Symbol]
+    case r
+    in Meta::TypeRef::Param(owner: o, name:)
+      o == owner && !found.include?(name) ? found.push(name) : found
+    in Meta::TypeRef::Of(args:)
+      out = found
+      args.each { |a| out = Job.params_of(a, owner, out) }
+      out
+    in Meta::TypeRef::Union(members:)
+      out = found
+      members.each { |m| out = Job.params_of(m, owner, out) }
+      out
+    else found
+    end
+  end
 
   # :nodoc:
   # `enqueue`'s keyword for the field `f`, typed by the field's declared

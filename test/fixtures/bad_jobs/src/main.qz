@@ -130,3 +130,31 @@ def more_calls(repo: Rotor::Repo) -> Void
   Typed.enqueue(repo: repo, note: "x")
   Typed.enqueue(repo: repo, ids: [1], counts: {"a" => "b"})
 end
+
+# divider#50: an args type with type parameters is refused at
+# `job_args`; a field of a generic type with its arguments written is
+# fine. (An alias, `type IntBox = Boxed[Int]`, cannot be given at all:
+# quarz refuses a type alias as a value.)
+data Boxed[T] = (v: T, label: String)
+data Pairs[K, V] = (keys: Array[K], values: Hash[String, V?])
+data Phantom[T] = (label: String)
+data Inner[T] = (x: T)
+data Nested = (inner: Inner[Int], ids: Array[Int])
+
+class BoxJob < Divider::Job
+  job_args Boxed[Int]
+end
+
+class PairsJob < Divider::Job
+  job_args Pairs[Int, String]
+end
+
+class PhantomJob < Divider::Job
+  job_args Phantom[Int]
+end
+
+class NestedJob < Divider::Job
+  job_args Nested
+  def perform(args: Nested, job: Divider::Context) -> Void
+  end
+end

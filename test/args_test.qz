@@ -47,6 +47,14 @@ class ArgsTest < Test::Case
     assert_match(/enqueue\(repo: Rotor::Repo, ids: Array\[Int\], .*\) -> Divider::Enqueued is missing the argument `ids`/, text)
     assert_match(/main\.qz:131:3: error: no overload of `enqueue` on Type\[Typed\] matches/, text)
     assert_match(/hash has type Hash\[String, String\] but Hash\[String, Int\] was expected/, text)
+    # divider#50: an args type with type parameters is refused at
+    # `job_args`, naming the job, the type and its parameters; one whose
+    # parameter no field mentions is refused by quarz at `enqueue_args`;
+    # a field of a generic type with its arguments written is fine.
+    assert_match(/main\.qz:145:3: error: `job_args` raised ArgumentError: BoxJob: the args type Boxed has type parameters \(T\), which a job's arguments cannot have: write a data type with the fields' types spelled out/, text)
+    assert_match(/main\.qz:149:3: error: `job_args` raised ArgumentError: PairsJob: the args type Pairs has type parameters \(K, V\)/, text)
+    assert_match(/main\.qz:153:3: error: `def_class_method\(:enqueue_args\)`: the keyword `args` is typed `Phantom`, which takes type arguments/, text)
+    refute_match(/main\.qz:15[6-9]:\d+: error/, text)
     # A job of arguments without `perform(args, job)`, and a subclass of
     # one declaring others.
     assert_match(/main\.qz:83:3: error: `method_ref\(:perform\)`: the handle to `NoPerform#perform` is a `Meta::Method\[NoPerform, \(Good, Divider::Context\) -> Void\]`, but `NoPerform` has no method `perform` of that type/, text)

@@ -82,7 +82,10 @@ end
   ([Divider::ArgsError], discarded, the error naming where: a deploy that
   changes an `Args` type should add fields with defaults). `enqueue_args` takes an `Args` value,
   checked fully. The argument-less `enqueue(repo)` a job with `job_args`
-  inherits raises [ArgumentError].
+  inherits raises [ArgumentError]. The `Args` type cannot have type
+  parameters: `job_args Boxed[Int]` for a generic `data Boxed[T]` is a
+  compile error (#50); a field of a generic type with its arguments
+  written (`ids: Array[Int]`, `inner: Inner[Int]`) is fine.
 - `unique` keeps one live job (scheduled, available, running, or failed
   with a retry pending) per class, values of the `by` arguments (fields
   without a default), and `period` (by the database's clock); `enqueue`
