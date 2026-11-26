@@ -122,3 +122,11 @@ class BlockInit < Divider::Job
     @tag = make.call
   end
 end
+
+# divider#8: in the keyword form, nil for a field that is not nullable
+# and a required field left out are compile errors, as in `enqueue_args`.
+def more_calls(repo: Rotor::Repo) -> Void
+  Fine.enqueue(repo: repo, user_id: nil)
+  Typed.enqueue(repo: repo, note: "x")
+  Typed.enqueue(repo: repo, ids: [1], counts: {"a" => "b"})
+end

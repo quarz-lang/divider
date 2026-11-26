@@ -39,6 +39,14 @@ class ArgsTest < Test::Case
     assert_match(/enqueue\(repo: Rotor::Repo, ids: Array\[Int\], note: String\? = \.\.\., counts: Hash\[String, Int\] = \.\.\..*: array elements have type String but Int was expected/, text)
     assert_match(/main\.qz:70:3: error: no overload of `enqueue` on Type\[Typed\] matches/, text)
     assert_match(/argument `note` of enqueue\(.*\) -> Divider::Enqueued expects String\? but found Int/, text)
+    # divider#8: nil for a field that is not nullable, a required field
+    # left out, and a hash of the wrong value type, in the keyword form.
+    assert_match(/main\.qz:129:3: error: no overload of `enqueue` on Type\[Fine\] matches/, text)
+    assert_match(/argument `user_id` of enqueue\(.*\) -> Divider::Enqueued expects Int but found Nil/, text)
+    assert_match(/main\.qz:130:3: error: no overload of `enqueue` on Type\[Typed\] matches/, text)
+    assert_match(/enqueue\(repo: Rotor::Repo, ids: Array\[Int\], .*\) -> Divider::Enqueued is missing the argument `ids`/, text)
+    assert_match(/main\.qz:131:3: error: no overload of `enqueue` on Type\[Typed\] matches/, text)
+    assert_match(/hash has type Hash\[String, String\] but Hash\[String, Int\] was expected/, text)
     # A job of arguments without `perform(args, job)`, and a subclass of
     # one declaring others.
     assert_match(/main\.qz:83:3: error: `method_ref\(:perform\)`: the handle to `NoPerform#perform` is a `Meta::Method\[NoPerform, \(Good, Divider::Context\) -> Void\]`, but `NoPerform` has no method `perform` of that type/, text)
