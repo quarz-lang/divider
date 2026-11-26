@@ -12,7 +12,7 @@
 # worker.run      # until shutdown; or Task.spawn { worker.run } beside an HTTP server
 # ```
 #
-# The worker opens connections to `url` as they are needed, and closes
+# The worker opens connections to the database as they are needed, and closes
 # those idle for 5 minutes:
 #
 # - the jobs' pool (`job.repo`), of at most `pool_size` connections (10
@@ -49,7 +49,8 @@
 class Worker
   include Shareable
 
-  @url: String
+  # The database's configuration (a URL is parsed into one).
+  @config: PG::Config
   # The jobs' pool (`job.repo`).
   @pool: PG::Pool
   # The pool of the worker's own statements.
@@ -78,7 +79,9 @@ class Worker
   # name reused after a crash does not keep the crashed run's alive).
   @running: Atom[Set[Int]]
 
-  # A worker of `jobs` (the classes it may run) over the database `url`,
+  # A worker of `jobs` (the classes it may run) over `database`, a URL or
+  # a [PG::Config] (a password from elsewhere than the URL, TLS settings
+  # given as keywords),
   # running `queues` (each queue's name, and how many of its jobs run at
   # once), and the recurring jobs of `cron`. `pool_size` bounds the jobs'
   # pool (10 by default; see above). [node] names this process in
@@ -87,7 +90,7 @@ class Worker
   # running worker's. `factories` make the instances of the classes that
   # need something from the application ([Divider.factory]): one per class
   # at most, of a class in `jobs`; the others are made with `new`.
-  def initialize(@url: String, *, jobs: Array[Type[Job]], queues: Hash[Symbol, Int] = {default: 10},
+  def initialize(database: String | PG::Config, *, jobs: Array[Type[Job]], queues: Hash[Symbol, Int] = {default: 10},
                  pool_size: Int? = nil, @poll: Duration = 1.second, node: String? = nil,
                  @heartbeat: Duration = 30.seconds, @stale_after: Duration = 5.minutes,
                  @keep_completed: Duration = 7.days, @keep_discarded: Duration = 30.days,
@@ -114,9 +117,11 @@ class Worker
     raise ArgumentError.new("stale_after (#{@stale_after}) must exceed heartbeat (#{@heartbeat})") if @stale_after <= @heartbeat
     size = pool_size || POOL_SIZE
     raise ArgumentError.new("pool_size is at least 1, not #{size}") if size < 1
-    @pool = PG::Pool.new(@url, size)
+    config = database.is_a?(String) ? PG.parse_url(database.as(String)) : database.as(PG::Config)
+    @config = config
+    @pool = PG::Pool.new(config, size)
     own = qs.values.sum + 2
-    @own = PG::Pool.new(@url, own < OWN_POOL_MAX ? own : OWN_POOL_MAX)
+    @own = PG::Pool.new(config, own < OWN_POOL_MAX ? own : OWN_POOL_MAX)
     @node = node || "#{Worker.hostname}-#{Process.pid}-#{Random.rand(1 << 32).to_s(16)}"
     @stop = Channel[Nil].new
     @force = Channel[Nil].new
@@ -128,10 +133,10 @@ class Worker
   # This process's name in the rows it runs.
   def node -> String = @node
 
-  # The worker without its database URL, which holds the password: the
-  # node, the queues and where the database is (host, port, database).
+  # The worker without its database's password: the node, the queues
+  # and where the database is (host, port, database).
   def inspect -> String
-    c = PG.parse_url(@url)
+    c = @config
     "#<Divider::Worker node: #{@node.inspect}, queues: #{@queues.inspect}, " +
       "database: #{"#{c.host}:#{c.port}/#{c.database || c.user}".inspect}>"
   end
@@ -198,7 +203,7 @@ class Worker
     until @stop.closed?
       conn: PG::Connection? = nil
       begin
-        c = PG.connect(@url)
+        c = PG::Connection.open(@config)
         conn = c
         c.listen(Queue::CHANNEL)
         wakes.each_value { |ch| ch.try_send(nil) }
@@ -570,7 +575,7 @@ data Fetched = (id: Int, class_name: String, queue: String, args: String, attemp
 # [error] the message of what it raised.
 data Event = (kind: Symbol, id: Int, class_name: String, queue: String, attempt: Int, duration_ms: Int?, error: String?)
 
-# A worker for a process of its own: runs `Worker.new(url, ...)` until
+# A worker for a process of its own: runs `Worker.new(database, ...)` until
 # SIGTERM or SIGINT, which shut it down with `grace` for the running
 # jobs.
 #
@@ -578,12 +583,12 @@ data Event = (kind: Symbol, id: Int, class_name: String, queue: String, attempt:
 # # src/main.qz of a worker process
 # Divider.serve(ENV["DATABASE_URL"], jobs: [Cleanup, PurgeSessions], queues: {default: 10, mail: 5})
 # ```
-public def serve(url: String, *, jobs: Array[Type[Job]], queues: Hash[Symbol, Int] = {default: 10},
+public def serve(database: String | PG::Config, *, jobs: Array[Type[Job]], queues: Hash[Symbol, Int] = {default: 10},
                  grace: Duration = 25.seconds, node: String? = nil, poll: Duration = 1.second,
                  on_error: (shareable (Exception, Context) -> Void)? = nil,
                  on_event: (shareable (Event) -> Void)? = nil, cron: Cron? = nil,
                  factories: Array[Factory] = []) -> Void
-  worker = Worker.new(url, jobs: jobs, queues: queues, node: node, poll: poll, on_error: on_error, on_event: on_event, cron: cron,
+  worker = Worker.new(database, jobs: jobs, queues: queues, node: node, poll: poll, on_error: on_error, on_event: on_event, cron: cron,
                       factories: factories)
   Signal.trap(:TERM) { worker.shutdown(grace) }
   Signal.trap(:INT) { worker.shutdown(grace) }
