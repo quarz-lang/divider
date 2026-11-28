@@ -88,15 +88,68 @@ class QueueTest < Test::Case
     with_repo do |repo, _|
       cols = repo.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'divider_jobs' ORDER BY ordinal_position") { |r| r.string(0) }
       assert_equal(["id", "class", "queue", "args", "priority", "state", "scheduled_at", "attempt", "max_attempts", "unique_key",
-                    "errors", "node", "locked_at", "inserted_at", "completed_at", "discarded_at", "cancelled_at"], cols)
+                    "errors", "node", "locked_at", "inserted_at", "completed_at", "discarded_at", "cancelled_at", "trace"], cols)
       indexes = repo.query("SELECT indexname FROM pg_indexes WHERE tablename = 'divider_jobs' ORDER BY indexname") { |r| r.string(0) }
       assert_equal(["divider_jobs_fetch", "divider_jobs_locked", "divider_jobs_pkey", "divider_jobs_prune", "divider_jobs_unique"], indexes)
       # The constraints hold.
       assert_raise(PG::Error) { repo.exec("INSERT INTO divider_jobs (class, queue, state) VALUES ('X', 'q', 'lost')") }
       assert_raise(PG::Error) { repo.exec("INSERT INTO divider_jobs (class, queue, priority) VALUES ('X', 'q', 10)") }
       m = Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_test_versions")
-      assert_equal([20261108000002, 20261108000001], m.rollback(steps: 2))
+      assert_equal([20261108000003, 20261108000002, 20261108000001], m.rollback(steps: 3))
       assert_equal(0, repo.query("SELECT count(*) FROM information_schema.tables WHERE table_name = 'divider_jobs'") { |r| r.int(0) }[0])
+    end
+  end
+
+  # divider#54: the trace column, NULL until divider reports to Trace; a
+  # database without its migration is told which one to run, at an
+  # enqueue (one job and several) and when a worker starts.
+  def test_trace_column_and_its_missing_migration
+    with_repo do |repo, url|
+      e = QtMail.enqueue(repo)
+      assert_nil(repo.query("SELECT trace::text FROM divider_jobs WHERE id = $1", [e.id]) { |r| r.string?(0) }[0])
+      QtBatch.enqueue_all(repo: repo, args: [QtBatch::Args.new(1)])
+      assert_equal(0, repo.query("SELECT count(*) FROM divider_jobs WHERE trace IS NOT NULL") { |r| r.int(0) }[0])
+      # Rolled back to before the migration: rows inserted before it are kept.
+      m = Rotor::Migrator.new(repo, Divider::Migrations.all, table: "divider_test_versions")
+      assert_equal([20261108000003], m.rollback(steps: 1))
+      [-> { QtMail.enqueue(repo); nil }, -> { QtBatch.enqueue_all(repo: repo, args: [QtBatch::Args.new(2)]); nil }].each do |f|
+        err = assert_raise(Divider::Error) { f.call }
+        assert_match(/run divider's migration 20261108000003 \(AddTrace/, err.message)
+      end
+      w = Divider::Worker.new(url, jobs: [QtMail], queues: {mail: 1}, node: "trace-check")
+      err = assert_raise(Divider::Error) { w.run }
+      assert_match(/migration 20261108000003/, err.message)
+      # Migrated again: old rows read NULL, and enqueueing works.
+      m.migrate
+      assert_equal(2, repo.query("SELECT count(*) FROM divider_jobs WHERE trace IS NULL") { |r| r.int(0) }[0])
+      QtMail.enqueue(repo)
+    end
+  end
+
+  # The worker's check resolves the table along the search path, as its
+  # statements do: tables in the second schema of `app, jobs` are found;
+  # no table on the path, and no `trace` column, are each told apart.
+  def test_schema_check_follows_the_search_path
+    with_repo do |repo, url|
+      sep = url.include?("?") ? "&" : "?"
+      at = ->(path: String) { "#{url}#{sep}options=#{URI.encode_component("-c search_path=#{path}")}" }
+      repo.exec("DROP SCHEMA IF EXISTS qt_app, qt_jobs CASCADE")
+      repo.exec("CREATE SCHEMA qt_app")
+      repo.exec("CREATE SCHEMA qt_jobs")
+      begin
+        PG::Pool.open(at.call("qt_jobs"), 1) do |pool|
+          jobs = Rotor::Repo.new(pool: pool)
+          Rotor::Migrator.new(jobs, Divider::Migrations.all, table: "divider_sp_versions").migrate
+        end
+        Divider::Worker.new(at.call("qt_app,qt_jobs"), jobs: [QtMail], queues: {mail: 1}, node: "sp").check_schema
+        e = assert_raise(Divider::Error) { Divider::Worker.new(at.call("qt_app"), jobs: [QtMail], queues: {mail: 1}, node: "sp").check_schema }
+        assert_match(/no table divider_jobs on the search path/, e.message)
+        repo.exec("ALTER TABLE qt_jobs.divider_jobs DROP COLUMN trace")
+        e = assert_raise(Divider::Error) { Divider::Worker.new(at.call("qt_app,qt_jobs"), jobs: [QtMail], queues: {mail: 1}, node: "sp").check_schema }
+        assert_match(/migration 20261108000003/, e.message)
+      ensure
+        repo.exec("DROP SCHEMA IF EXISTS qt_app, qt_jobs CASCADE")
+      end
     end
   end
 
