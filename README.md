@@ -29,6 +29,21 @@ def migrate(repo: Rotor::Repo, app: Array[Type[Rotor::Migration]]) -> Void
 end
 ```
 
+**Upgrading.** A version that adds a migration needs it run before the
+new code runs. `20261108000003` (`AddTrace`, divider#54) adds the
+nullable column `divider_jobs.trace`, where a job will keep the trace
+context it was enqueued in. It is NULL until divider reports to the
+standard `Trace` module. The order:
+
+1. Run the migrations (`Divider::Migrations.all` includes it). The
+   column is added without rewriting the table.
+2. Deploy the new enqueuers and workers, in any order.
+
+An old worker ignores the column, and a new one reads NULL from rows
+inserted before. Against a database without the migration, a new
+enqueue raises `Divider::Error` and a new worker refuses to start; both
+name the migration to run.
+
 ## Jobs
 
 ```crystal

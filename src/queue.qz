@@ -46,8 +46,12 @@ module Queue
     u = job.unique
     key = u ? Queue.key(repo, job, u) : nil
     3.times do
-      found = repo.query(INSERT, [job.class_name, job.queue, job.args, p, job.at, after_ms, job.max_attempts, key]) do |r|
-        Enqueued.new(r.int(0), r.string(1).to_sym, r.time(2))
+      # (`$9`, the trace context: none until divider reports to `Trace`.)
+      trace: String? = nil
+      found = Queue.inserting do
+        repo.query(INSERT, [job.class_name, job.queue, job.args, p, job.at, after_ms, job.max_attempts, key, trace]) do |r|
+          Enqueued.new(r.int(0), r.string(1).to_sym, r.time(2))
+        end
       end
       return [found[0], true] unless found.empty?
       # (A live job holds the key.)
@@ -65,8 +69,8 @@ module Queue
   # `scheduled` when that is later than now, else `available` and the
   # queue notified. Nothing on a conflict of the unique key.
   INSERT = "WITH due AS (SELECT COALESCE($5::timestamptz, now() + COALESCE($6::bigint, 0) * interval '1 millisecond') AS at), " +
-           "ins AS (INSERT INTO divider_jobs (class, queue, args, priority, state, scheduled_at, max_attempts, unique_key) " +
-           "SELECT $1, $2, $3::jsonb, $4, CASE WHEN due.at > now() THEN 'scheduled' ELSE 'available' END, due.at, $7, $8 FROM due " +
+           "ins AS (INSERT INTO divider_jobs (class, queue, args, priority, state, scheduled_at, max_attempts, unique_key, trace) " +
+           "SELECT $1, $2, $3::jsonb, $4, CASE WHEN due.at > now() THEN 'scheduled' ELSE 'available' END, due.at, $7, $8, $9::jsonb FROM due " +
            "ON CONFLICT (unique_key) WHERE state IN ('scheduled', 'available', 'running', 'failed') DO NOTHING " +
            "RETURNING id, state, scheduled_at) " +
            "SELECT ins.id, ins.state, ins.scheduled_at, " +
@@ -166,12 +170,29 @@ module Queue
       params = params + [JSON.generate(u.by), u.period_ms]
       key = Queue.key_sql("$1", "t.a::jsonb", "$8::jsonb", "$9::bigint")
     end
-    sql = "WITH input AS (SELECT t.a::jsonb AS j, t.ord, #{key} AS k FROM unnest($3::text[]) WITH ORDINALITY AS t(a, ord)), " + INSERT_ALL
-    repo.query(sql, params) do |r|
-      id = r.int?(0)
-      e: Enqueued? = id ? Enqueued.new(id, r.string(1).to_sym, r.time(2)) : nil
-      [e, r.string?(3)]
+    # (The trace context, last: none until divider reports to `Trace`.)
+    trace: String? = nil
+    params = params + [trace]
+    sql = "WITH input AS (SELECT t.a::jsonb AS j, t.ord, #{key} AS k FROM unnest($3::text[]) WITH ORDINALITY AS t(a, ord)), " +
+          Queue.insert_all_sql("$#{params.size}::jsonb")
+    Queue.inserting do
+      repo.query(sql, params) do |r|
+        id = r.int?(0)
+        e: Enqueued? = id ? Enqueued.new(id, r.string(1).to_sym, r.time(2)) : nil
+        [e, r.string?(3)]
+      end
     end
+  end
+
+  # :nodoc:
+  # The block's insertion, a database without the `trace` column
+  # (divider's migration 20261108000003 not run) reported by naming the
+  # migration rather than by pg's "column does not exist".
+  def self.inserting[R](&: () -> R) -> R
+    yield
+  rescue PG::ServerError => e
+    raise Error.new(Migrations::MISSING_TRACE) if e.code == "42703" && e.message.include?("trace")
+    raise e
   end
 
   # The rest of `.insert_rows`' statement, after its input (`j` the
@@ -183,13 +204,18 @@ module Queue
   # gets does not matter). This depends on no order of the insertion and
   # needs no privilege on the id's sequence. An input left without a row
   # (its key held, perhaps by an equal input just inserted) gets NULL.
-  INSERT_ALL = "due AS (SELECT COALESCE($5::timestamptz, now() + COALESCE($6::bigint, 0) * interval '1 millisecond') AS at), " +
-               "ins AS (INSERT INTO divider_jobs (class, queue, args, priority, state, scheduled_at, max_attempts, unique_key) " +
+  # :nodoc:
+  # The rest of `.insert_rows` statement, `trace` the trace context's
+  # parameter.
+  def self.insert_all_sql(trace: String) -> String
+    "due AS (SELECT COALESCE($5::timestamptz, now() + COALESCE($6::bigint, 0) * interval '1 millisecond') AS at), " +
+               "ins AS (INSERT INTO divider_jobs (class, queue, args, priority, state, scheduled_at, max_attempts, unique_key, trace) " +
                "SELECT $1, $2, input.j, $4, CASE WHEN due.at > now() THEN 'scheduled' ELSE 'available' END, " +
-               "due.at, $7, input.k FROM input, due ORDER BY input.ord " +
+               "due.at, $7, input.k, #{trace} FROM input, due ORDER BY input.ord " +
                "ON CONFLICT (unique_key) WHERE state IN ('scheduled', 'available', 'running', 'failed') DO NOTHING " +
                "RETURNING id, state, scheduled_at, args), " +
                "i AS (SELECT ord, j, k, row_number() OVER (PARTITION BY j ORDER BY ord) AS n FROM input), " +
                "o AS (SELECT id, state, scheduled_at, args, row_number() OVER (PARTITION BY args ORDER BY id) AS n FROM ins) " +
                "SELECT o.id, o.state, o.scheduled_at, i.k FROM i LEFT JOIN o ON o.args = i.j AND o.n = i.n ORDER BY i.ord"
+  end
 end

@@ -12,7 +12,14 @@
 # add migrations, never change these.
 module Migrations
   # The migrations, in order.
-  def self.all -> Array[Type[Rotor::Migration]] = [CreateJobs, CreateCron]
+  def self.all -> Array[Type[Rotor::Migration]] = [CreateJobs, CreateCron, AddTrace]
+
+  # :nodoc:
+  # What a database without [AddTrace] is told, at an enqueue or when a
+  # worker starts.
+  MISSING_TRACE = "divider_jobs has no column trace: run divider's migration 20261108000003 (AddTrace, in " +
+                  "Divider::Migrations.all) before running this version of divider"
+
 end
 
 # The table `divider_jobs` and its indexes: one row a job, from its
@@ -58,6 +65,20 @@ class Migrations::CreateJobs < Rotor::Migration
             "ADD CONSTRAINT divider_jobs_attempts CHECK (max_attempts >= 1 AND attempt >= 0)",
             down: "ALTER TABLE divider_jobs DROP CONSTRAINT divider_jobs_state, " +
                   "DROP CONSTRAINT divider_jobs_priority, DROP CONSTRAINT divider_jobs_attempts"
+  end
+end
+
+# The column `divider_jobs.trace` (divider#54): the context a job was
+# enqueued in, as the headers a `Trace` subscriber injected
+# (`{"traceparent": "00-..."}`), so that its attempts are traced as part
+# of the request that enqueued it; NULL when nothing listened (and, until
+# divider reports to `Trace`, always). Nullable without a default:
+# added without rewriting the table.
+class Migrations::AddTrace < Rotor::Migration
+  version 20261108000003
+
+  def change -> Void
+    add_column :divider_jobs, :trace, sql: "jsonb", null: true
   end
 end
 
