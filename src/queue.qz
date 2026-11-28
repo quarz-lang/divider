@@ -191,7 +191,15 @@ module Queue
   def self.inserting[R](&: () -> R) -> R
     yield
   rescue PG::ServerError => e
-    raise Error.new(Migrations::MISSING_TRACE) if e.code == "42703" && e.message.include?("trace")
+    # (The column by the error's own field when the server fills it,
+    # else by the primary message's quoted name, `column "trace" of
+    # relation ...`: PostgreSQL leaves the column field empty for an
+    # undefined column.)
+    column = e.fields["c"]?
+    if column.nil? && (m = (e.fields["M"]? || "").match(/\Acolumn "([^"]*)"/))
+      column = m[1]
+    end
+    raise Error.new(Migrations::MISSING_TRACE) if e.code == "42703" && column == "trace"
     raise e
   end
 

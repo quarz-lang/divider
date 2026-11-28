@@ -126,6 +126,33 @@ class QueueTest < Test::Case
     end
   end
 
+  # The worker's check resolves the table along the search path, as its
+  # statements do: tables in the second schema of `app, jobs` are found;
+  # no table on the path, and no `trace` column, are each told apart.
+  def test_schema_check_follows_the_search_path
+    with_repo do |repo, url|
+      sep = url.include?("?") ? "&" : "?"
+      at = ->(path: String) { "#{url}#{sep}options=#{URI.encode_component("-c search_path=#{path}")}" }
+      repo.exec("DROP SCHEMA IF EXISTS qt_app, qt_jobs CASCADE")
+      repo.exec("CREATE SCHEMA qt_app")
+      repo.exec("CREATE SCHEMA qt_jobs")
+      begin
+        PG::Pool.open(at.call("qt_jobs"), 1) do |pool|
+          jobs = Rotor::Repo.new(pool: pool)
+          Rotor::Migrator.new(jobs, Divider::Migrations.all, table: "divider_sp_versions").migrate
+        end
+        Divider::Worker.new(at.call("qt_app,qt_jobs"), jobs: [QtMail], queues: {mail: 1}, node: "sp").check_schema
+        e = assert_raise(Divider::Error) { Divider::Worker.new(at.call("qt_app"), jobs: [QtMail], queues: {mail: 1}, node: "sp").check_schema }
+        assert_match(/no table divider_jobs on the search path/, e.message)
+        repo.exec("ALTER TABLE qt_jobs.divider_jobs DROP COLUMN trace")
+        e = assert_raise(Divider::Error) { Divider::Worker.new(at.call("qt_app,qt_jobs"), jobs: [QtMail], queues: {mail: 1}, node: "sp").check_schema }
+        assert_match(/migration 20261108000003/, e.message)
+      ensure
+        repo.exec("DROP SCHEMA IF EXISTS qt_app, qt_jobs CASCADE")
+      end
+    end
+  end
+
   def test_enqueue_now_and_later
     with_repo do |repo, _|
       e = QtMail.enqueue(repo)

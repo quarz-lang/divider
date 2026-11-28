@@ -471,13 +471,20 @@ class Worker
   end
 
   # :nodoc:
-  # Refuses to run on a database without divider's migration
-  # 20261108000003 (the `trace` column, divider#54), naming it.
+  # Refuses to run on a database without divider's tables, or without
+  # its migration 20261108000003 (the `trace` column, divider#54), naming
+  # what to run. The table is resolved as the worker's statements resolve
+  # it, along the whole search path (`to_regclass`), not in
+  # `current_schema()` alone, so tables in a later schema of the path are
+  # found.
   def check_schema -> Void
     repo = Rotor::Repo.new(pool: @own)
-    found = repo.query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() " +
-                       "AND table_name = 'divider_jobs' AND column_name = 'trace'", Array[Object?].new) { |_| 1 }
-    raise Error.new(Migrations::MISSING_TRACE) if found.empty?
+    found = repo.query("SELECT to_regclass('divider_jobs') IS NOT NULL, EXISTS (SELECT 1 FROM pg_attribute " +
+                       "WHERE attrelid = to_regclass('divider_jobs') AND attname = 'trace' AND NOT attisdropped)",
+                       Array[Object?].new) { |r| [r.bool(0), r.bool(1)] }
+    table, column = found[0]
+    raise Error.new(Migrations::MISSING_TABLES) unless table
+    raise Error.new(Migrations::MISSING_TRACE) unless column
     nil
   end
 

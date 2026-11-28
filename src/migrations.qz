@@ -15,6 +15,11 @@ module Migrations
   def self.all -> Array[Type[Rotor::Migration]] = [CreateJobs, CreateCron, AddTrace]
 
   # :nodoc:
+  # What a worker started on a database without divider's tables is told.
+  MISSING_TABLES = "there is no table divider_jobs on the search path: run divider's migrations " +
+                   "(Divider::Migrations.all) before starting a worker"
+
+  # :nodoc:
   # What a database without [AddTrace] is told, at an enqueue or when a
   # worker starts.
   MISSING_TRACE = "divider_jobs has no column trace: run divider's migration 20261108000003 (AddTrace, in " +
